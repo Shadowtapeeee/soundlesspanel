@@ -1,0 +1,10 @@
+services:
+  soundless:
+    build: .
+    container_name: soundless
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./data:/data
