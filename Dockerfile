@@ -2,7 +2,7 @@
 # .env is NOT copied into the image; it is passed at runtime (docker run --env-file .env / compose env_file).
 FROM node:24-alpine
 
-RUN apk add --no-cache ffmpeg tzdata
+RUN apk add --no-cache ffmpeg yt-dlp tzdata
 
 WORKDIR /app
 COPY soundless.js ./

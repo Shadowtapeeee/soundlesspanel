@@ -11,6 +11,8 @@ const fsp = require('node:fs/promises');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const { spawn } = require('node:child_process');
+const { Readable } = require('node:stream');
+const { pipeline } = require('node:stream/promises');
 const { DatabaseSync } = require('node:sqlite');
 
 try { if (fs.existsSync(path.join(process.cwd(), '.env'))) process.loadEnvFile(path.join(process.cwd(), '.env')); } catch (e) { console.warn('[env]', e.message); }
@@ -26,6 +28,7 @@ const CFG = {
   publicUrl: (process.env.PUBLIC_URL || '').replace(/\/+$/, ''),
   downloadUrl: process.env.DOWNLOAD_URL || 'https://github.com/Shadowtapeeee/soundless',
   audiusApp: process.env.AUDIUS_APP_NAME || 'SOUNDLESS',
+  ytdlp: process.env.YTDLP_PATH || 'yt-dlp',
   translate: (process.env.TRANSLATE_PROVIDER || 'mymemory').toLowerCase(),
   libreUrl: (process.env.LIBRETRANSLATE_URL || '').replace(/\/+$/, ''),
   libreKey: process.env.LIBRETRANSLATE_KEY || '',
@@ -33,9 +36,17 @@ const CFG = {
   ffmpeg: process.env.FFMPEG_PATH || 'ffmpeg',
   premiumEmoji: process.env.PREMIUM_EMOJI !== '0',
   trustProxy: process.env.TRUST_PROXY === '1',
+  googleId: (process.env.GOOGLE_CLIENT_ID || '').trim(),
+  googleSecret: (process.env.GOOGLE_CLIENT_SECRET || '').trim(),
+  scId: (process.env.SOUNDCLOUD_CLIENT_ID || '').trim(),
+  scSecret: (process.env.SOUNDCLOUD_CLIENT_SECRET || '').trim(),
+  spId: (process.env.SPOTIFY_CLIENT_ID || '').trim(),
+  spSecret: (process.env.SPOTIFY_CLIENT_SECRET || '').trim(),
+  cdnUrl: (process.env.CDN_URL || '').replace(/\/+$/, ''),
+  captchaDifficulty: Number(process.env.CAPTCHA_DIFFICULTY) || 40000,
 };
 const UA = `Soundless/${VERSION} (+${CFG.downloadUrl})`;
-const DIRS = ['tracks', 'covers', 'avatars', 'banners', 'tmp'].reduce((o, d) => (o[d] = path.join(CFG.dataDir, d), o), {});
+const DIRS = ['tracks', 'covers', 'avatars', 'banners', 'plcovers', 'tmp'].reduce((o, d) => (o[d] = path.join(CFG.dataDir, d), o), {});
 for (const d of Object.values(DIRS)) fs.mkdirSync(d, { recursive: true });
 
 const now = () => Date.now();
@@ -77,6 +88,22 @@ CREATE TABLE IF NOT EXISTS kv(k TEXT PRIMARY KEY, v TEXT);
 CREATE TABLE IF NOT EXISTS codes(code TEXT PRIMARY KEY, kind TEXT, user_id INTEGER, data TEXT, created_at INTEGER, expires_at INTEGER);
 CREATE TABLE IF NOT EXISTS bot_users(chat_id INTEGER PRIMARY KEY, username TEXT, first_name TEXT, created_at INTEGER, blocked INTEGER DEFAULT 0);
 CREATE TABLE IF NOT EXISTS bot_state(chat_id INTEGER PRIMARY KEY, state TEXT, data TEXT, msg_id INTEGER);
+`);
+// Миграции без потери данных
+for (const sql of [
+  'ALTER TABLE users ADD COLUMN google_sub TEXT', 'ALTER TABLE users ADD COLUMN google_email TEXT',
+  "ALTER TABLE users ADD COLUMN taste_artists TEXT DEFAULT '[]'", "ALTER TABLE users ADD COLUMN profile_ext TEXT DEFAULT '{}'",
+  'ALTER TABLE users ADD COLUMN sync_state TEXT', 'ALTER TABLE playlists ADD COLUMN cover TEXT', 'ALTER TABLE tracks ADD COLUMN waveform TEXT',
+]) { try { db.exec(sql); } catch {} }
+db.exec(`
+CREATE UNIQUE INDEX IF NOT EXISTS users_google ON users(google_sub) WHERE google_sub IS NOT NULL;
+CREATE TABLE IF NOT EXISTS subscriptions(user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, plan TEXT NOT NULL DEFAULT 'aura',
+  started_at INTEGER, expires_at INTEGER, granted_by INTEGER, note TEXT);
+CREATE TABLE IF NOT EXISTS offline_items(user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, device TEXT NOT NULL, track_id TEXT NOT NULL,
+  bytes INTEGER DEFAULT 0, created_at INTEGER, PRIMARY KEY(user_id, device, track_id));
+CREATE TABLE IF NOT EXISTS generations(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, kind TEXT, created_at INTEGER);
+CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, kind TEXT, created_at INTEGER);
+CREATE INDEX IF NOT EXISTS events_user ON events(user_id, kind);
 `);
 const stmts = new Map();
 const S = (sql) => { let s = stmts.get(sql); if (!s) { s = db.prepare(sql); stmts.set(sql, s); } return s; };
@@ -133,6 +160,7 @@ async function memoize(key, ttl, fn) {
 }
 
 let ffmpegOk = false;
+let ytdlpOk = false;
 function sh(cmd, args, timeout = 120000) {
   return new Promise((resolve) => {
     let out = '', err = ''; let p;
@@ -143,7 +171,18 @@ function sh(cmd, args, timeout = 120000) {
     p.on('close', (code) => { clearTimeout(t); resolve({ code, out, err }); });
   });
 }
-sh(CFG.ffmpeg, ['-version'], 8000).then((r) => { ffmpegOk = r.code === 0; log(ffmpegOk ? '[ffmpeg] найден' : '[ffmpeg] не найден — обложки/нормализация из файлов отключены'); });
+const toolsReady = Promise.all([sh(CFG.ffmpeg, ['-version'], 8000), sh(CFG.ytdlp, ['--version'], 8000)]).then(([ffmpeg, ytdlp]) => {
+  ffmpegOk = ffmpeg.code === 0;
+  ytdlpOk = ytdlp.code === 0;
+  log(ffmpegOk ? '[ffmpeg] найден' : '[ffmpeg] не найден — обложки/нормализация/волны из файлов отключены');
+  log(ytdlpOk ? '[yt-dlp] найден' : '[yt-dlp] не найден — офлайн-загрузка использует поток SoundCloud');
+  if (ffmpegOk) (async () => {
+    for (const t of all('SELECT id, file FROM tracks WHERE waveform IS NULL LIMIT 500')) { // досчитываем волны для старых треков
+      const w = await computeWaveform(path.join(DIRS.tracks, t.file)).catch(() => null);
+      if (w) run('UPDATE tracks SET waveform=? WHERE id=?', JSON.stringify(w), t.id);
+    }
+  })().catch((e) => log('[waveform backfill]', e.message));
+});
 async function probeAudio(file) {
   if (!ffmpegOk) return {};
   const r = await sh(CFG.ffmpeg, ['-hide_banner', '-nostats', '-i', file, '-af', 'ebur128=framelog=quiet', '-f', 'null', '-'], 300000);
@@ -160,20 +199,25 @@ async function extractCover(file, out) {
 }
 
 /* ───────────────────────────── Модели ───────────────────────────── */
-const mediaUrl = (kind, file) => (file ? `/api/media/${kind}/${file}` : null);
+const mediaUrl = (kind, file) => (file ? `${CFG.cdnUrl}/api/media/${kind}/${file}` : null);
 const isOnline = (u) => !!u.last_seen && now() - u.last_seen < 120000;
 const playsCount = (uid) => one('SELECT COUNT(*) c FROM plays WHERE user_id=?', uid).c;
 function publicUser(u, mini = false) {
   if (!u) return null;
   const pv = J(u.privacy, {});
-  const base = { id: u.id, username: u.username, name: u.name, avatar: mediaUrl('avatars', u.avatar), color: u.color || null, verified: !!u.verified, online: pv.showOnline === false ? null : isOnline(u) };
+  const ents = entitlementsOf(u.id);
+  const base = { id: u.id, username: u.username, name: u.name, avatar: mediaUrl('avatars', u.avatar), color: u.color || null, verified: !!u.verified, online: pv.showOnline === false ? null : isOnline(u), aura: ents.has('aura.badge') };
   if (mini) return base;
   const links = J(u.links, []).filter((l) => l && l.url);
   if (u.tg_username && pv.showTelegram !== false) links.unshift({ type: 'telegram', title: u.tg_username, url: `https://t.me/${u.tg_username}` });
-  return { ...base, bio: u.bio || '', banner: mediaUrl('banners', u.banner), links, createdAt: u.created_at, lastSeen: pv.showOnline === false ? null : u.last_seen, level: levelOf(playsCount(u.id)), telegram: pv.showTelegram !== false ? u.tg_username || null : null };
+  return { ...base, bio: u.bio || '', banner: mediaUrl('banners', u.banner), links, createdAt: u.created_at, lastSeen: pv.showOnline === false ? null : u.last_seen, level: levelOf(playsCount(u.id)), ext: ents.has('profile.extended') ? J(u.profile_ext, {}) : {} };
 }
 function privateUser(u) {
-  return { ...publicUser(u), privacy: J(u.privacy, {}), prefs: J(u.prefs, {}), taste: J(u.taste, []), notify: J(u.notify, {}), telegramLinked: !!u.tg_id, telegramUsername: u.tg_username || null, hasPassword: u.pass !== '!', linksRaw: J(u.links, []) };
+  return {
+    ...publicUser(u), privacy: J(u.privacy, {}), prefs: J(u.prefs, {}), taste: J(u.taste, []), tasteArtists: J(u.taste_artists, []), notify: J(u.notify, {}),
+    hasPassword: u.pass !== '!', linksRaw: J(u.links, []), google: u.google_sub ? { linked: true, email: u.google_email || null } : { linked: false },
+    entitlements: [...entitlementsOf(u.id)], limits: limitsOf(u.id), subscription: auraOf(u.id), extRaw: J(u.profile_ext, {}),
+  };
 }
 const userQ = (u) => lower(`${u.username} ${u.name}`);
 
@@ -191,14 +235,41 @@ function auArtist(u) {
   if (!u) return null; const p = u.profile_picture || {};
   return { id: 'au:' + u.id, source: 'audius', name: u.name, handle: u.handle, avatar: p['480x480'] || p['150x150'] || null, verified: !!u.is_verified, followers: u.follower_count || 0, tracks: u.track_count || 0, bio: u.bio || '' };
 }
+function auAlbum(a) {
+  if (!a || a.is_delete || a.is_private) return null;
+  const artwork = a.artwork || {};
+  return { id: 'au:' + a.id, source: 'audius', title: a.playlist_name || a.title || 'Без названия', type: String(a.release_type || a.set_type || 'album').toLowerCase(), trackCount: a.total_track_count || a.track_count || a.tracks?.length || 0, cover: artwork['1000x1000'] || artwork['480x480'] || artwork['150x150'] || null, releaseDate: a.release_date || a.created_at || '' };
+}
 function sanitizeTrack(t) {
   if (!t || typeof t !== 'object') return null;
   const id = String(t.id || '').slice(0, 160);
-  if (!/^(sl|au|local):/.test(id)) return null;
+  if (!/^(sl|au|local|sc|dz|sp):/.test(id)) return null;
   const s = (v, n = 300) => (v == null ? '' : String(v).slice(0, n));
   const url = (v) => (typeof v === 'string' && (/^https:\/\//.test(v) || /^\/api\//.test(v)) ? v.slice(0, 1000) : null);
-  return { id, source: s(t.source, 20), title: s(t.title) || 'Без названия', artist: s(t.artist) || 'Неизвестен', artistId: t.artistId ? s(t.artistId, 200) : null, album: s(t.album), genre: s(t.genre, 60), duration: Math.max(0, Math.round(+t.duration || 0)), cover: url(t.cover), coverLarge: url(t.coverLarge), coverSmall: url(t.coverSmall), explicit: !!t.explicit };
+  return { id, source: s(t.source, 20), title: s(t.title) || 'Без названия', artist: s(t.artist) || 'Неизвестен', artistId: t.artistId ? s(t.artistId, 200) : null, album: s(t.album), genre: s(t.genre, 60), duration: Math.max(0, Math.round(+t.duration || 0)), cover: url(t.cover), coverLarge: url(t.coverLarge), coverSmall: url(t.coverSmall), explicit: !!t.explicit, preview: t.preview ? url(t.preview) : undefined };
 }
+
+/* ───────────────────────────── Aura: подписка и разрешения ───────────────────────────── */
+const GB = 1024 ** 3;
+const AURA_ENT = ['aura.badge', 'profile.extended', 'media.animated', 'mixes.advanced', 'playlists.text.unlimited', 'karaoke.plus', 'offline.extended', 'sync', 'stats.detailed', 'rooms.10', 'achievements.extended', 'early_access'];
+function auraOf(uid) {
+  const s = one('SELECT * FROM subscriptions WHERE user_id=?', uid);
+  if (!s) return { active: false };
+  const active = !s.expires_at || s.expires_at > now();
+  return { active, plan: s.plan, startedAt: s.started_at, expiresAt: s.expires_at || null };
+}
+function entitlementsOf(uid) {
+  const ents = new Set(['base']);
+  if (auraOf(uid).active) for (const e of AURA_ENT) ents.add(e);
+  return ents;
+}
+const can = (uid, e) => entitlementsOf(uid).has(e);
+function limitsOf(uid) {
+  const e = entitlementsOf(uid);
+  return { roomSize: e.has('rooms.10') ? 10 : 5, offlineBytes: e.has('offline.extended') ? 10 * GB : 1 * GB, textPlaylistsPerDay: e.has('playlists.text.unlimited') ? null : 3, statsDays: e.has('stats.detailed') ? 365 : 30 };
+}
+const requireEnt = (uid, e, msg) => { if (!can(uid, e)) fail(402, 'aura_required', msg || 'Доступно с подпиской Soundless Aura'); };
+const logEvent = (uid, kind) => run('INSERT INTO events(user_id,kind,created_at) VALUES(?,?,?)', uid, kind, now());
 
 /* ───────────────────────────── Audius ───────────────────────────── */
 const AUDIUS = 'https://api.audius.co/v1';
@@ -413,7 +484,7 @@ function nowPlayingOf(u) {
 }
 
 /* ───────────────────────────── HTTP ───────────────────────────── */
-const CORS = { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': 'authorization, content-type, x-device, range', 'Access-Control-Allow-Methods': 'GET, POST, PUT, PATCH, DELETE, OPTIONS', 'Access-Control-Expose-Headers': 'content-length, content-range, accept-ranges', 'Access-Control-Max-Age': '86400' };
+const CORS = { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': 'authorization, content-type, x-device, range, if-none-match, if-modified-since', 'Access-Control-Allow-Methods': 'GET, POST, PUT, PATCH, DELETE, OPTIONS', 'Access-Control-Expose-Headers': 'content-length, content-range, accept-ranges, etag, last-modified', 'Access-Control-Max-Age': '86400' };
 class HttpError extends Error { constructor(status, code, message) { super(message || code); this.status = status; this.code = code; } }
 const fail = (status, code, message) => { throw new HttpError(status, code, message); };
 function send(res, status, body, headers = {}) {
@@ -433,7 +504,11 @@ const MIME = { '.mp3': 'audio/mpeg', '.m4a': 'audio/mp4', '.aac': 'audio/aac', '
 async function sendFile(req, res, file, mime, cache = 'public, max-age=31536000, immutable') {
   let st; try { st = await fsp.stat(file); } catch { return send(res, 404, { error: 'not_found' }); }
   const size = st.size; const type = mime || MIME[path.extname(file).toLowerCase()] || 'application/octet-stream';
-  const h = { 'Content-Type': type, 'Accept-Ranges': 'bytes', 'Cache-Control': cache, ...CORS };
+  const etag = `W/"${size.toString(36)}-${Math.floor(st.mtimeMs).toString(36)}"`;
+  const lastMod = new Date(st.mtimeMs).toUTCString();
+  const h = { 'Content-Type': type, 'Accept-Ranges': 'bytes', 'Cache-Control': cache, ETag: etag, 'Last-Modified': lastMod, ...CORS };
+  const inm = req.headers['if-none-match']; const ims = req.headers['if-modified-since'];
+  if (!req.headers.range && ((inm && inm === etag) || (!inm && ims && Date.parse(ims) >= Math.floor(st.mtimeMs / 1000) * 1000))) { res.writeHead(304, { ETag: etag, 'Last-Modified': lastMod, 'Cache-Control': cache, ...CORS }); return res.end(); }
   const m = /bytes=(\d*)-(\d*)/.exec(req.headers.range || '');
   if (m && (m[1] || m[2])) {
     let start = m[1] === '' ? size - Number(m[2]) : Number(m[1]);
@@ -482,11 +557,6 @@ const RESERVED = new Set(['admin', 'soundless', 'support', 'root', 'api', 'syste
 
 function notify(userId, type, actorId, data = {}) {
   run('INSERT INTO notifications(user_id,type,actor_id,data,created_at) VALUES(?,?,?,?,?)', userId, type, actorId, JSON.stringify(data), now());
-  const u = one('SELECT tg_id, notify FROM users WHERE id=?', userId); const a = one('SELECT username, name FROM users WHERE id=?', actorId);
-  if (u?.tg_id && a && J(u.notify, {}).telegram !== false && bot.ready) {
-    const text = type === 'friend' ? `${em('people')} <b>${esc(a.name)}</b> (@${esc(a.username)}) теперь ваш друг` : type === 'follow' ? `${em('userOk')} <b>${esc(a.name)}</b> (@${esc(a.username)}) подписался на вас` : null;
-    if (text) bot.send(u.tg_id, text).catch(() => {});
-  }
 }
 
 const routes = [];
@@ -494,9 +564,11 @@ const route = (method, pattern, handler) => routes.push({ method, re: new RegExp
 
 route('GET', '/api/health', () => ({ ok: true, name: 'Soundless', version: VERSION, time: now() }));
 route('GET', '/api/config', () => ({
-  name: 'Soundless', version: VERSION, registration: flag('registration'), maintenance: flag('maintenance'), audius: flag('audius'),
-  telegram: bot.username ? { bot: bot.username, url: `https://t.me/${bot.username}` } : null, download: CFG.downloadUrl,
+  name: 'Soundless', version: VERSION, registration: flag('registration'), maintenance: flag('maintenance'),
+  google: !!(CFG.googleId && CFG.googleSecret && CFG.publicUrl),
+  sources: { catalog: true, deezer: true, soundcloud: !!(CFG.scId && CFG.scSecret), spotify: !!(CFG.spId && CFG.spSecret), audius: flag('audius') },
   announcements: all('SELECT id, text, created_at createdAt FROM announcements WHERE active=1 ORDER BY id DESC LIMIT 5'),
+  aura: { contact: /^https:\/\//.test(process.env.AURA_CONTACT || '') ? process.env.AURA_CONTACT : null },
 }));
 
 /* — Авторизация — */
@@ -504,6 +576,7 @@ route('POST', '/api/auth/register', async (req) => {
   rateLimit(req, 'reg', 8, 3600e3);
   if (!flag('registration')) fail(403, 'registration_closed', 'Регистрация временно закрыта');
   const b = await readJSON(req);
+  verifyCaptcha(b.captcha);
   const username = String(b.username || '').trim().toLowerCase(); const name = String(b.name || '').trim().slice(0, 40) || username; const password = String(b.password || '');
   if (!validUsername(username) || RESERVED.has(username)) fail(400, 'bad_username', 'Логин: 3–24 символа, латиница, цифры, «_» и «.»');
   if (password.length < 6 || password.length > 128) fail(400, 'bad_password', 'Пароль должен быть от 6 символов');
@@ -516,53 +589,13 @@ route('POST', '/api/auth/register', async (req) => {
 route('POST', '/api/auth/login', async (req) => {
   rateLimit(req, 'login', 20, 600e3);
   const b = await readJSON(req);
+  verifyCaptcha(b.captcha);
   const u = one('SELECT * FROM users WHERE username=?', String(b.username || '').trim().replace(/^@/, ''));
   if (!u || !(await checkPass(String(b.password || ''), u.pass))) fail(401, 'bad_credentials', 'Неверный логин или пароль');
   if (u.banned) fail(403, 'banned', 'Аккаунт заблокирован');
   return { token: createSession(req, u.id), user: privateUser(u) };
 });
 route('POST', '/api/auth/logout', (req) => { const a = auth(req); run('DELETE FROM sessions WHERE token=?', a.token); return { ok: true }; });
-route('POST', '/api/auth/telegram/start', (req) => {
-  rateLimit(req, 'tgstart', 30, 600e3);
-  if (!bot.username) fail(503, 'bot_unavailable', 'Вход через Telegram не настроен на сервере');
-  const code = token(12);
-  run('INSERT INTO codes(code,kind,data,created_at,expires_at) VALUES(?,?,?,?,?)', code, 'login', JSON.stringify({ status: 'pending', device: String(req.headers['x-device'] || '').slice(0, 80) }), now(), now() + 10 * 60000);
-  return { code, url: `https://t.me/${bot.username}?start=login_${code}`, expiresIn: 600 };
-});
-route('GET', '/api/auth/telegram/poll', (req, { query }) => {
-  const c = one('SELECT * FROM codes WHERE code=? AND kind=?', String(query.get('code') || ''), 'login');
-  if (!c || c.expires_at < now()) return { status: 'expired' };
-  const d = J(c.data, {});
-  if (d.status === 'ok' && c.user_id) {
-    run('DELETE FROM codes WHERE code=?', c.code);
-    const u = one('SELECT * FROM users WHERE id=?', c.user_id);
-    if (!u || u.banned) return { status: 'denied' };
-    return { status: 'ok', token: createSession(req, u.id), user: privateUser(u) };
-  }
-  return { status: d.status || 'pending' };
-});
-route('POST', '/api/auth/reset/start', async (req) => {
-  rateLimit(req, 'reset', 5, 600e3);
-  const b = await readJSON(req); const u = one('SELECT * FROM users WHERE username=?', String(b.username || '').trim().replace(/^@/, ''));
-  if (!u || !u.tg_id || !bot.ready) return { sent: false, message: 'Сброс доступен только для аккаунтов с привязанным Telegram' };
-  const code = String(crypto.randomInt(100000, 999999));
-  run('DELETE FROM codes WHERE kind=? AND user_id=?', 'reset', u.id);
-  run('INSERT INTO codes(code,kind,user_id,data,created_at,expires_at) VALUES(?,?,?,?,?,?)', 'reset:' + u.id + ':' + code, 'reset', u.id, '{}', now(), now() + 10 * 60000);
-  await bot.send(u.tg_id, `${em('lock')} <b>Сброс пароля Soundless</b>\n\nКод: <code>${code}</code>\n\n${em('clock')} Действует 10 минут. Если это были не вы — просто проигнорируйте сообщение.`).catch(() => {});
-  return { sent: true };
-});
-route('POST', '/api/auth/reset/finish', async (req) => {
-  rateLimit(req, 'resetf', 10, 600e3);
-  const b = await readJSON(req); const u = one('SELECT * FROM users WHERE username=?', String(b.username || '').trim().replace(/^@/, ''));
-  if (!u) fail(400, 'bad_code', 'Неверный код');
-  const c = one('SELECT * FROM codes WHERE code=?', 'reset:' + u.id + ':' + String(b.code || '').trim());
-  if (!c || c.expires_at < now()) fail(400, 'bad_code', 'Неверный или просроченный код');
-  if (String(b.password || '').length < 6) fail(400, 'bad_password', 'Пароль должен быть от 6 символов');
-  run('UPDATE users SET pass=? WHERE id=?', await hashPass(String(b.password)), u.id);
-  run('DELETE FROM sessions WHERE user_id=?', u.id); run('DELETE FROM codes WHERE code=?', c.code);
-  return { token: createSession(req, u.id), user: privateUser(one('SELECT * FROM users WHERE id=?', u.id)) };
-});
-
 /* — Профиль — */
 route('GET', '/api/me', (req) => privateUser(auth(req).user));
 route('PATCH', '/api/me', async (req) => {
@@ -575,6 +608,11 @@ route('PATCH', '/api/me', async (req) => {
   if (b.prefs !== undefined && typeof b.prefs === 'object') { const s = JSON.stringify(b.prefs); if (s.length < 20000) set.prefs = s; }
   if (b.taste !== undefined && Array.isArray(b.taste)) set.taste = JSON.stringify(b.taste.slice(0, 20).map((x) => String(x).slice(0, 40)));
   if (b.notify !== undefined && typeof b.notify === 'object') set.notify = JSON.stringify({ ...J(user.notify, {}), ...b.notify });
+  if (b.ext !== undefined) {
+    requireEnt(user.id, 'profile.extended', 'Расширенная персонализация профиля доступна с Aura');
+    const e = b.ext || {}; const THEMES = ['none', 'aurora', 'ember', 'frost', 'noir', 'bloom'];
+    set.profile_ext = JSON.stringify({ theme: THEMES.includes(e.theme) ? e.theme : 'none', glow: /^#[0-9a-f]{6}$/i.test(e.glow || '') ? e.glow : null, pinned: e.pinned ? sanitizeTrack(e.pinned) : null, status: String(e.status || '').slice(0, 60) });
+  }
   if (b.username !== undefined && String(b.username).toLowerCase() !== user.username.toLowerCase()) {
     const un = String(b.username).trim().toLowerCase();
     if (!validUsername(un) || RESERVED.has(un)) fail(400, 'bad_username', 'Логин: 3–24 символа, латиница, цифры, «_» и «.»');
@@ -588,6 +626,12 @@ route('PATCH', '/api/me', async (req) => {
   }
   return privateUser(one('SELECT * FROM users WHERE id=?', user.id));
 });
+function isAnimated(buf, ext) {
+  if (ext === '.gif') { let frames = 0; for (let i = 0; i < buf.length - 1 && frames < 2; i++) if (buf[i] === 0x21 && buf[i + 1] === 0xf9) frames++; return frames > 1; }
+  if (ext === '.webp') return buf.includes(Buffer.from('ANIM'));
+  if (ext === '.png') return buf.includes(Buffer.from('acTL'));
+  return false;
+}
 function imageExt(buf) {
   if (buf[0] === 0xff && buf[1] === 0xd8) return '.jpg';
   if (buf.slice(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) return '.png';
@@ -599,6 +643,7 @@ for (const kind of ['avatar', 'banner']) {
   route('PUT', `/api/me/${kind}`, async (req) => {
     const { user } = auth(req); const buf = await readBody(req, 6 << 20);
     const ext = imageExt(buf); if (!ext) fail(400, 'bad_image', 'Поддерживаются JPG, PNG, WEBP, GIF');
+    if (isAnimated(buf, ext)) requireEnt(user.id, 'media.animated', 'Анимированные аватары и баннеры доступны с Aura');
     const name = `${user.id}_${token(6)}${ext}`; const dir = DIRS[kind + 's'];
     await fsp.writeFile(path.join(dir, name), buf);
     if (user[kind]) fsp.unlink(path.join(dir, user[kind])).catch(() => {});
@@ -623,27 +668,12 @@ route('POST', '/api/me/password', async (req) => {
 route('GET', '/api/me/sessions', (req) => { const { user, token: tok } = auth(req); return all('SELECT token, device, ip, created_at createdAt, last_used lastUsed FROM sessions WHERE user_id=? ORDER BY last_used DESC', user.id).map((s) => ({ id: sha1(s.token).slice(0, 16), device: s.device, ip: s.ip, createdAt: s.createdAt, lastUsed: s.lastUsed, current: s.token === tok })); });
 route('DELETE', '/api/me/sessions/:id', (req, { params }) => { const { user, token: tok } = auth(req); for (const s of all('SELECT token FROM sessions WHERE user_id=?', user.id)) if (sha1(s.token).slice(0, 16) === params.id && s.token !== tok) run('DELETE FROM sessions WHERE token=?', s.token); return { ok: true }; });
 route('DELETE', '/api/me/sessions', (req) => { const { user, token: tok } = auth(req); run('DELETE FROM sessions WHERE user_id=? AND token<>?', user.id, tok); return { ok: true }; });
-route('POST', '/api/me/telegram/link', (req) => {
-  const { user } = auth(req); if (!bot.username) fail(503, 'bot_unavailable', 'Telegram-бот не настроен на сервере');
-  const code = token(12); run('INSERT INTO codes(code,kind,user_id,data,created_at,expires_at) VALUES(?,?,?,?,?,?)', code, 'link', user.id, '{}', now(), now() + 15 * 60000);
-  return { url: `https://t.me/${bot.username}?start=link_${code}` };
-});
-route('DELETE', '/api/me/telegram', (req) => { const { user } = auth(req); run('UPDATE users SET tg_id=NULL, tg_username=NULL WHERE id=?', user.id); return privateUser(one('SELECT * FROM users WHERE id=?', user.id)); });
 route('DELETE', '/api/me', async (req) => {
   const { user } = auth(req); const b = await readJSON(req);
   if (user.pass !== '!' && !(await checkPass(String(b.password || ''), user.pass))) fail(400, 'bad_password', 'Неверный пароль');
   for (const k of ['avatar', 'banner']) if (user[k]) fsp.unlink(path.join(DIRS[k + 's'], user[k])).catch(() => {});
   run('DELETE FROM users WHERE id=?', user.id);
   return { ok: true };
-});
-route('GET', '/api/me/stats', (req, { query }) => {
-  const { user } = auth(req); const tz = clamp(Number(query.get('tz')) || 0, -900, 900) * 60000;
-  const days = []; const start = Math.floor((now() - tz) / DAY) * DAY + tz - 13 * DAY;
-  const rows = all('SELECT played_at, listened FROM plays WHERE user_id=? AND played_at>=?', user.id, start);
-  for (let i = 0; i < 14; i++) days.push({ date: start + i * DAY, plays: 0, seconds: 0 });
-  for (const r of rows) { const i = Math.floor((r.played_at - start) / DAY); if (days[i]) { days[i].plays++; days[i].seconds += r.listened || 0; } }
-  const tot = one('SELECT COUNT(*) c, SUM(listened) s, COUNT(DISTINCT artist_key) a, COUNT(DISTINCT track_id) t FROM plays WHERE user_id=?', user.id);
-  return { plays: tot.c, seconds: tot.s || 0, artists: tot.a, tracks: tot.t, level: levelOf(tot.c), days, topArtists: topArtists(user.id, 0, 10), topTracks: topTracks(user.id, 0, 10), monthArtists: topArtists(user.id, now() - 30 * DAY, 5) };
 });
 route('GET', '/api/me/notifications', (req) => {
   const { user } = auth(req);
@@ -671,6 +701,7 @@ route('GET', '/api/users/:username', (req, { params }) => {
     topArtists: hidden || pv.showStats === false ? [] : topArtists(u.id, 0, 8),
     topTracks: hidden || pv.showStats === false ? [] : topTracks(u.id, 0, 8),
     compatibility: self || hidden ? null : compatibility(me.id, u.id),
+    achievements: hidden ? [] : achievementsOf(u.id).filter((a) => a.unlocked).map(({ id, title, desc, ext }) => ({ id, title, desc, ext })),
     me: self ? null : publicUser(me, true),
   };
 });
@@ -700,36 +731,25 @@ route('GET', '/api/friends/activity', (req) => {
     .map((x) => ({ ...publicUser(x, true), nowPlaying: nowPlayingOf(x) }));
 });
 route('GET', '/api/media/:kind/:file', (req, { params, res }) => {
-  if (!['avatars', 'banners'].includes(params.kind) || !/^[\w.-]+$/.test(params.file)) fail(404, 'not_found');
+  if (!['avatars', 'banners', 'plcovers'].includes(params.kind) || !/^[\w.-]+$/.test(params.file)) fail(404, 'not_found');
   return sendFile(req, res, path.join(DIRS[params.kind], params.file));
 });
 
 /* — Музыка — */
-route('GET', '/api/search', async (req, { query }) => {
-  auth(req); const q = String(query.get('q') || '').trim().slice(0, 100); const type = query.get('type') || 'all';
-  if (!q) return { tracks: [], artists: [], users: [] };
-  const [au, auUsers] = await Promise.all([type === 'users' ? [] : auSearch(q, type === 'tracks' ? 40 : 24), type === 'all' || type === 'artists' ? safe(audius('/users/search', { query: q, limit: 10 })) : []]);
-  const tracks = type === 'users' ? [] : [...catalogSearch(q, 30), ...au];
-  const artists = type === 'all' || type === 'artists' ? [...catalogArtists(q), ...(auUsers || []).filter((u) => u.track_count > 0).map(auArtist)] : [];
-  const users = type === 'all' || type === 'users' ? all('SELECT * FROM users WHERE q LIKE ? AND banned=0 ORDER BY last_seen DESC LIMIT 10', `%${lower(q).replace(/^@/, '')}%`).map((u) => publicUser(u, true)) : [];
-  return { tracks, artists, users };
+route('GET', '/api/trending', async (req, { query }) => {
+  auth(req); const genre = String(query.get('genre') || '').slice(0, 40) || undefined;
+  if (flag('audius')) { const list = await safe(auTrending(genre, 40, query.get('time') || 'week'), []); if (list.length) return list; }
+  // Без Audius жанровые подборки собираем из открытого каталога Deezer
+  const pls = await safe(dz('/search/playlist', { q: genre || 'top hits', limit: 6 }, 6 * 3600e3), {});
+  const pl = (pls.data || []).find((p) => p.nb_tracks >= 20) || pls.data?.[0];
+  if (!pl) return [];
+  const tr = await safe(dz(`/playlist/${pl.id}/tracks`, { limit: 60 }, 6 * 3600e3), {});
+  return (tr.data || []).map(dzTrack).filter(Boolean);
 });
-route('GET', '/api/trending', async (req, { query }) => { auth(req); return auTrending(query.get('genre') || undefined, 40, query.get('time') || 'week'); });
-route('GET', '/api/catalog', (req, { query }) => { auth(req); const off = Number(query.get('offset')) || 0; return all('SELECT * FROM tracks ORDER BY id DESC LIMIT 50 OFFSET ?', off).map(slTrack); });
-route('GET', '/api/artist', async (req, { query }) => {
-  auth(req); const id = String(query.get('id') || '');
-  if (id.startsWith('sl:')) {
-    const name = id.slice(3); const tracks = all('SELECT * FROM tracks WHERE q LIKE ? ORDER BY plays DESC LIMIT 200', `%${lower(name)}%`).filter((t) => lower(t.artist).includes(lower(name))).map(slTrack);
-    const au = await auSearch(name, 12);
-    return { artist: { id, source: 'soundless', name, avatar: tracks[0]?.cover || null, tracks: tracks.length }, tracks: [...tracks, ...au.filter((t) => lower(t.artist).includes(lower(name)))] };
-  }
-  if (id.startsWith('au:')) {
-    const uid = id.slice(3);
-    const [u, tr] = await Promise.all([safe(audius('/users/' + encodeURIComponent(uid)), null), safe(audius(`/users/${encodeURIComponent(uid)}/tracks`, { limit: 50, sort: 'plays' }))]);
-    if (!u) fail(404, 'not_found', 'Исполнитель не найден');
-    return { artist: auArtist(u), tracks: tr.map(auTrack).filter(Boolean) };
-  }
-  fail(400, 'bad_id');
+route('GET', '/api/catalog', (req, { query }) => {
+  auth(req); const limit = clamp(Number(query.get('limit')) || 30, 1, 100); const offset = Math.max(0, Number(query.get('offset')) || 0);
+  const items = all('SELECT * FROM tracks ORDER BY id DESC LIMIT ? OFFSET ?', limit + 1, offset).map(slTrack);
+  return { items: items.slice(0, limit), offset, hasMore: items.length > limit, total: one('SELECT COUNT(*) c FROM tracks').c };
 });
 route('GET', '/api/tracks/:id', async (req, { params }) => {
   auth(req); const id = decodeURIComponent(params.id);
@@ -755,7 +775,7 @@ async function transcoded(t, kbps) {
   return fs.existsSync(out) ? { file: out, mime: 'audio/mpeg' } : { file: src, mime: t.mime };
 }
 setInterval(async () => { // чистим кэш перекодирования старше 14 дней
-  for (const f of await fsp.readdir(DIRS.tmp).catch(() => [])) { const p = path.join(DIRS.tmp, f); const st = await fsp.stat(p).catch(() => null); if (st && now() - st.mtimeMs > 14 * DAY) fsp.unlink(p).catch(() => {}); }
+  for (const f of await fsp.readdir(DIRS.tmp).catch(() => [])) { const p = path.join(DIRS.tmp, f); const st = await fsp.stat(p).catch(() => null); if (st && now() - st.mtimeMs > 14 * DAY) fsp.rm(p, { recursive: true, force: true }).catch(() => {}); }
 }, 6 * 3600e3).unref();
 route('GET', '/api/stream/:id', async (req, { params, res, query }) => {
   auth(req); const t = one('SELECT * FROM tracks WHERE id=?', Number(params.id)); if (!t) fail(404, 'not_found', 'Трек не найден');
@@ -772,7 +792,7 @@ route('GET', '/api/lyrics', async (req, { query }) => {
   return getLyrics({ id: query.get('id') || '', title: query.get('title') || '', artist: query.get('artist') || '', album: query.get('album') || '', duration: Number(query.get('duration')) || 0 });
 });
 route('POST', '/api/translate', async (req) => {
-  auth(req); rateLimit(req, 'tr', 40, 600e3); const b = await readJSON(req);
+  const { user } = auth(req); rateLimit(req, 'tr', can(user.id, 'karaoke.plus') ? 400 : 40, 600e3); const b = await readJSON(req);
   if (!Array.isArray(b.lines) || !b.lines.length) fail(400, 'bad_request');
   try { return await translateLines(b.lines, String(b.to || '').slice(0, 5)); } catch (e) { log('[translate]', e.message); fail(502, 'translate_failed', 'Не удалось перевести текст'); }
 });
@@ -786,7 +806,7 @@ route('POST', '/api/history', async (req) => {
   if (t.id.startsWith('sl:')) run('UPDATE tracks SET plays=plays+1 WHERE id=?', +t.id.slice(3));
   return { ok: true, level: levelOf(playsCount(user.id)) };
 });
-route('GET', '/api/history', (req, { query }) => { const { user } = auth(req); return all('SELECT data, played_at FROM plays WHERE user_id=? ORDER BY id DESC LIMIT ?', user.id, clamp(Number(query.get('limit')) || 100, 1, 500)).map((r) => ({ ...J(r.data, {}), playedAt: r.played_at })); });
+route('GET', '/api/history', (req, { query }) => { const { user } = auth(req); return all('SELECT data, played_at FROM plays WHERE user_id=? ORDER BY id DESC LIMIT ? OFFSET ?', user.id, clamp(Number(query.get('limit')) || 100, 1, 500), Math.max(0, Number(query.get('offset')) || 0)).map((r) => ({ ...J(r.data, {}), playedAt: r.played_at })); });
 route('DELETE', '/api/history', (req) => { const { user } = auth(req); run('DELETE FROM plays WHERE user_id=?', user.id); return { ok: true }; });
 route('POST', '/api/presence', async (req) => {
   const { user } = auth(req); const b = await readJSON(req); const t = b.track ? sanitizeTrack(b.track) : null;
@@ -800,13 +820,29 @@ route('PUT', '/api/likes', async (req) => { const { user } = auth(req); const t 
 route('DELETE', '/api/likes/:id', (req, { params }) => { const { user } = auth(req); run('DELETE FROM likes WHERE user_id=? AND track_id=?', user.id, decodeURIComponent(params.id)); return { ok: true }; });
 function playlistOut(p, withTracks) {
   const tracks = all('SELECT id, data FROM playlist_tracks WHERE playlist_id=? ORDER BY pos, id', p.id).map((r) => ({ ...J(r.data, {}), entryId: r.id }));
-  return { id: p.id, name: p.name, description: p.description, public: !!p.public, createdAt: p.created_at, updatedAt: p.updated_at, count: tracks.length, covers: tracks.filter((t) => t.cover).slice(0, 4).map((t) => t.cover), duration: tracks.reduce((s, t) => s + (t.duration || 0), 0), tracks: withTracks ? tracks : undefined, owner: publicUser(one('SELECT * FROM users WHERE id=?', p.user_id), true) };
+  return { id: p.id, name: p.name, description: p.description, public: !!p.public, createdAt: p.created_at, updatedAt: p.updated_at, count: tracks.length, cover: mediaUrl('plcovers', p.cover), covers: tracks.filter((t) => t.cover).slice(0, 4).map((t) => t.cover), duration: tracks.reduce((s, t) => s + (t.duration || 0), 0), tracks: withTracks ? tracks : undefined, owner: publicUser(one('SELECT * FROM users WHERE id=?', p.user_id), true) };
 }
+route('PUT', '/api/playlists/:id/cover', async (req, { params }) => {
+  const { user } = auth(req); const p = ownPlaylist(user.id, params.id); const buf = await readBody(req, 6 << 20);
+  const ext = imageExt(buf); if (!ext) fail(400, 'bad_image', 'Поддерживаются JPG, PNG, WEBP, GIF');
+  if (isAnimated(buf, ext)) requireEnt(user.id, 'media.animated', 'Анимированные обложки доступны с Aura');
+  const name = `pl${p.id}_${token(6)}${ext}`; await fsp.writeFile(path.join(DIRS.plcovers, name), buf);
+  if (p.cover) fsp.unlink(path.join(DIRS.plcovers, p.cover)).catch(() => {});
+  run('UPDATE playlists SET cover=?, updated_at=? WHERE id=?', name, now(), p.id);
+  return playlistOut(one('SELECT * FROM playlists WHERE id=?', p.id), true);
+});
+route('DELETE', '/api/playlists/:id/cover', (req, { params }) => {
+  const { user } = auth(req); const p = ownPlaylist(user.id, params.id);
+  if (p.cover) fsp.unlink(path.join(DIRS.plcovers, p.cover)).catch(() => {});
+  run('UPDATE playlists SET cover=NULL, updated_at=? WHERE id=?', now(), p.id);
+  return playlistOut(one('SELECT * FROM playlists WHERE id=?', p.id), true);
+});
 const ownPlaylist = (uid, id) => { const p = one('SELECT * FROM playlists WHERE id=?', Number(id)); if (!p || p.user_id !== uid) fail(404, 'not_found', 'Плейлист не найден'); return p; };
 route('GET', '/api/playlists', (req) => { const { user } = auth(req); return all('SELECT * FROM playlists WHERE user_id=? ORDER BY updated_at DESC', user.id).map((p) => playlistOut(p, false)); });
 route('POST', '/api/playlists', async (req) => {
   const { user } = auth(req); const b = await readJSON(req); const name = String(b.name || '').trim().slice(0, 80) || 'Новый плейлист';
   const r = run('INSERT INTO playlists(user_id,name,description,public,created_at,updated_at) VALUES(?,?,?,?,?,?)', user.id, name, String(b.description || '').slice(0, 300), b.public === false ? 0 : 1, now(), now());
+  logEvent(user.id, 'playlist');
   return playlistOut(one('SELECT * FROM playlists WHERE id=?', Number(r.lastInsertRowid)), true);
 });
 route('GET', '/api/playlists/:id', (req, { params }) => {
@@ -843,37 +879,801 @@ route('GET', '/api/users/:username/playlists', (req, { params }) => {
 /* — Главная — */
 function shuffle(a) { a = a.slice(); for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; } return a; }
 function uniq(list) { const seen = new Set(); return list.filter((t) => t && !seen.has(t.id) && seen.add(t.id)); }
+/* ───────────────────────────── CAPTCHA (proof-of-work, проверка на сервере) ───────────────────────────── */
+const CAPTCHA_SECRET = process.env.CAPTCHA_SECRET || kv('captcha_secret') || (() => { const v = token(32); setKv('captcha_secret', v); return v; })();
+const sha256hex = (v) => crypto.createHash('sha256').update(v).digest('hex');
+const hmacHex = (v) => crypto.createHmac('sha256', CAPTCHA_SECRET).update(v).digest('hex');
+const safeEq = (a, b) => { const x = Buffer.from(String(a)); const y = Buffer.from(String(b)); return x.length === y.length && crypto.timingSafeEqual(x, y); };
+route('GET', '/api/captcha', (req) => {
+  rateLimit(req, 'captcha', 60, 600e3);
+  const max = CFG.captchaDifficulty;
+  const number = crypto.randomInt(0, max);
+  const expires = now() + 5 * 60e3;
+  const salt = `${token(9)}.${expires}`;
+  const challenge = sha256hex(salt + number);
+  return { algorithm: 'SHA-256', challenge, salt, maxnumber: max, signature: hmacHex(challenge) };
+});
+function verifyCaptcha(p) {
+  if (!p || typeof p !== 'object') fail(400, 'captcha_required', 'Подтвердите, что вы не робот');
+  const salt = String(p.salt || ''); const challenge = String(p.challenge || ''); const number = Number(p.number);
+  const expires = Number(salt.split('.').pop());
+  if (!expires || expires < now()) fail(400, 'captcha_expired', 'Проверка устарела — пройдите её ещё раз');
+  if (!Number.isInteger(number) || !safeEq(hmacHex(challenge), p.signature || '') || sha256hex(salt + number) !== challenge) fail(400, 'captcha_invalid', 'Проверка не пройдена');
+  const key = 'cap:' + challenge;
+  if (one('SELECT 1 FROM codes WHERE code=?', key)) fail(400, 'captcha_used', 'Проверка уже использована — пройдите её ещё раз');
+  run('INSERT INTO codes(code,kind,data,created_at,expires_at) VALUES(?,?,?,?,?)', key, 'captcha', '{}', now(), expires);
+}
+
+/* ───────────────────────────── Google: вход и привязка ───────────────────────────── */
+const googleReady = () => !!(CFG.googleId && CFG.googleSecret && CFG.publicUrl);
+function htmlPage(res, ok, title, text) {
+  res.writeHead(ok ? 200 : 400, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+  res.end(`<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Soundless</title><body style="margin:0;min-height:100vh;display:grid;place-items:center;background:#000;color:#ece6da;font:16px 'Segoe UI',system-ui,sans-serif"><div style="text-align:center;padding:32px;max-width:420px"><div style="font:italic 600 44px Georgia,serif;margin-bottom:10px">Soundless</div><div style="width:56px;height:56px;margin:18px auto;border-radius:18px;display:grid;place-items:center;font-size:28px;background:${ok ? '#e8e0cc;color:#000' : '#2a1414;color:#ff6b5e'}">${ok ? '✓' : '!'}</div><h2 style="margin:8px 0;font-weight:700">${esc(title)}</h2><p style="opacity:.6;line-height:1.5">${esc(text)}</p></div></body>`);
+}
+route('POST', '/api/auth/google/start', async (req) => {
+  rateLimit(req, 'gstart', 30, 600e3);
+  if (!googleReady()) fail(503, 'google_unavailable', 'Вход через Google временно недоступен');
+  const b = await readJSON(req);
+  const mode = b.mode === 'link' ? 'link' : 'login';
+  let userId = null;
+  if (mode === 'link') userId = auth(req).user.id; else verifyCaptcha(b.captcha);
+  const state = token(18); const verifier = token(48);
+  const challenge = crypto.createHash('sha256').update(verifier).digest('base64url');
+  run('INSERT INTO codes(code,kind,user_id,data,created_at,expires_at) VALUES(?,?,?,?,?,?)', 'g:' + state, 'google', userId, JSON.stringify({ status: 'pending', mode, verifier }), now(), now() + 10 * 60e3);
+  const u = new URL('https://accounts.google.com/o/oauth2/v2/auth');
+  const params = { client_id: CFG.googleId, redirect_uri: `${CFG.publicUrl}/api/auth/google/callback`, response_type: 'code', scope: 'openid email profile', state, code_challenge: challenge, code_challenge_method: 'S256', prompt: 'select_account' };
+  // Быстрый вход: подсказываем Google последний использованный адрес, чтобы не выбирать аккаунт заново
+  const hint = String(b.hint || '').trim();
+  if (/^[^\s@]{1,64}@[^\s@]{1,190}$/.test(hint)) { params.login_hint = hint; delete params.prompt; }
+  u.search = new URLSearchParams(params).toString();
+  return { state, url: u.toString() };
+});
+route('GET', '/api/auth/google/callback', async (req, { query, res }) => {
+  const state = String(query.get('state') || ''); const code = query.get('code');
+  const c = one('SELECT * FROM codes WHERE code=?', 'g:' + state);
+  if (!c || c.expires_at < now()) return htmlPage(res, false, 'Ссылка устарела', 'Вернитесь в приложение и попробуйте ещё раз.');
+  const d = J(c.data, {});
+  const finish = (patch) => run('UPDATE codes SET data=?, user_id=? WHERE code=?', JSON.stringify({ ...d, ...patch }), patch.userId ?? c.user_id, c.code);
+  if (!code || query.get('error')) { finish({ status: 'error', message: 'Вход через Google отменён' }); return htmlPage(res, false, 'Вход отменён', 'Вы можете закрыть это окно.'); }
+  try {
+    const tok = await fetchJSON('https://oauth2.googleapis.com/token', { method: 'POST', timeout: 15000, headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ code, client_id: CFG.googleId, client_secret: CFG.googleSecret, redirect_uri: `${CFG.publicUrl}/api/auth/google/callback`, grant_type: 'authorization_code', code_verifier: d.verifier }).toString() });
+    const info = await fetchJSON('https://openidconnect.googleapis.com/v1/userinfo', { timeout: 15000, headers: { authorization: 'Bearer ' + tok.access_token } });
+    if (!info.sub) throw new Error('no sub');
+    if (d.mode === 'link') {
+      const other = one('SELECT id FROM users WHERE google_sub=? AND id<>?', info.sub, c.user_id);
+      if (other) { finish({ status: 'error', message: 'Этот Google-аккаунт уже привязан к другому профилю' }); return htmlPage(res, false, 'Аккаунт уже занят', 'Этот Google-аккаунт привязан к другому профилю Soundless.'); }
+      run('UPDATE users SET google_sub=?, google_email=? WHERE id=?', info.sub, info.email || null, c.user_id);
+      finish({ status: 'ok' });
+      return htmlPage(res, true, 'Google привязан', 'Вернитесь в приложение — всё готово.');
+    }
+    let u = one('SELECT * FROM users WHERE google_sub=?', info.sub);
+    if (!u) {
+      if (!flag('registration')) { finish({ status: 'error', message: 'Регистрация временно закрыта' }); return htmlPage(res, false, 'Регистрация закрыта', 'Попробуйте позже.'); }
+      let un = lower(String(info.email || '').split('@')[0]).replace(/[^a-z0-9_.]/g, '').replace(/^[._]+|[._]+$/g, '').slice(0, 20);
+      if (!validUsername(un) || RESERVED.has(un)) un = 'user' + crypto.randomInt(1e5, 1e7);
+      while (one('SELECT id FROM users WHERE username=?', un)) un = (un.slice(0, 16) + crypto.randomInt(10, 9999)).slice(0, 24);
+      const name = String(info.name || un).slice(0, 40);
+      const r = run('INSERT INTO users(username,name,pass,google_sub,google_email,created_at,last_seen,q) VALUES(?,?,?,?,?,?,?,?)', un, name, '!', info.sub, info.email || null, now(), now(), lower(`${un} ${name}`));
+      u = one('SELECT * FROM users WHERE id=?', Number(r.lastInsertRowid));
+      bot.onRegister(u.id);
+    }
+    if (u.banned) { finish({ status: 'error', message: 'Аккаунт заблокирован' }); return htmlPage(res, false, 'Аккаунт заблокирован', ''); }
+    finish({ status: 'ok', userId: u.id });
+    return htmlPage(res, true, 'Вход выполнен', 'Вернитесь в приложение Soundless.');
+  } catch (e) {
+    log('[google]', e.message); finish({ status: 'error', message: 'Не удалось войти через Google' });
+    return htmlPage(res, false, 'Не получилось', 'Попробуйте ещё раз.');
+  }
+});
+route('GET', '/api/auth/google/poll', (req, { query }) => {
+  const c = one('SELECT * FROM codes WHERE code=?', 'g:' + String(query.get('state') || ''));
+  if (!c || c.expires_at < now()) return { status: 'expired' };
+  const d = J(c.data, {});
+  if (d.status === 'ok') {
+    run('DELETE FROM codes WHERE code=?', c.code);
+    const u = one('SELECT * FROM users WHERE id=?', c.user_id);
+    if (!u || u.banned) return { status: 'error', message: 'Аккаунт недоступен' };
+    return d.mode === 'login' ? { status: 'ok', token: createSession(req, u.id), user: privateUser(u) } : { status: 'ok', user: privateUser(u) };
+  }
+  if (d.status === 'error') { run('DELETE FROM codes WHERE code=?', c.code); return { status: 'error', message: d.message }; }
+  return { status: 'pending' };
+});
+route('DELETE', '/api/me/google', (req) => {
+  const { user } = auth(req);
+  if (user.pass === '!') fail(400, 'no_password', 'Сначала задайте пароль, иначе вы не сможете войти');
+  run('UPDATE users SET google_sub=NULL, google_email=NULL WHERE id=?', user.id);
+  return privateUser(one('SELECT * FROM users WHERE id=?', user.id));
+});
+
+/* ───────────────────────────── Источники: Deezer (открытый API), SoundCloud и Spotify (официальные API) ───────────────────────────── */
+const normText = (v) => lower(v).replace(/\([^)]*\)|\[[^\]]*\]/g, ' ').replace(/\b(feat|ft)\.?\b.*$/i, ' ').replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
+const trackKey = (t) => normText(primaryArtist(t.artist)) + '|' + normText(t.title);
+async function dz(p, params = {}, ttl = 600000) {
+  const u = new URL('https://api.deezer.com' + p);
+  for (const [k, v] of Object.entries(params)) if (v != null && v !== '') u.searchParams.set(k, v);
+  return memoize('dz:' + u, ttl, async () => {
+    const j = await withRetry(() => fetchJSON(u.toString(), { timeout: 9000 }));
+    if (j && j.error) { const e = new Error('deezer: ' + (j.error.message || j.error.type)); e.status = 502; throw e; }
+    return j;
+  });
+}
+function dzTrack(t) {
+  if (!t || t.readable === false || !t.id) return null;
+  const al = t.album || {};
+  return { id: 'dz:' + t.id, source: 'deezer', title: t.title, artist: t.artist?.name || '', artistId: t.artist?.id ? 'dz:' + t.artist.id : null, album: al.title || '', duration: t.duration || 0, cover: al.cover_big || al.cover_medium || null, coverLarge: al.cover_xl || al.cover_big || null, coverSmall: al.cover_medium || al.cover_small || null, explicit: !!t.explicit_lyrics, preview: t.preview || null, rank: t.rank || 0 };
+}
+const dzArtist = (a) => a && { id: 'dz:' + a.id, source: 'deezer', name: a.name, avatar: a.picture_xl || a.picture_big || a.picture_medium || null, followers: a.nb_fan || 0 };
+const dzAlbum = (a) => a && ({ id: 'dz:' + a.id, source: 'deezer', title: a.title || 'Без названия', type: String(a.record_type || 'album').toLowerCase(), trackCount: a.nb_tracks || 0, cover: a.cover_xl || a.cover_big || a.cover_medium || null, releaseDate: a.release_date || '' });
+async function withRetry(fn, tries = 3) {
+  let last;
+  for (let i = 0; i < tries; i++) {
+    try { return await fn(); } catch (e) { last = e; if (e.status && e.status < 500 && e.status !== 429) throw e; await sleep(300 * 2 ** i + Math.random() * 200); }
+  }
+  throw last;
+}
+const scState = { token: null, exp: 0 };
+const scReady = () => !!(CFG.scId && CFG.scSecret);
+async function scToken() {
+  if (!scReady()) return null;
+  if (scState.token && scState.exp > now() + 60000) return scState.token;
+  const r = await fetchJSON('https://secure.soundcloud.com/oauth/token', { method: 'POST', timeout: 10000, headers: { 'content-type': 'application/x-www-form-urlencoded', authorization: 'Basic ' + Buffer.from(`${CFG.scId}:${CFG.scSecret}`).toString('base64') }, body: 'grant_type=client_credentials' });
+  scState.token = r.access_token; scState.exp = now() + (r.expires_in || 3600) * 1000;
+  return scState.token;
+}
+async function scApi(p, params = {}, ttl = 300000) {
+  const t = await scToken(); if (!t) return null;
+  const u = new URL('https://api.soundcloud.com' + p);
+  for (const [k, v] of Object.entries(params)) if (v != null && v !== '') u.searchParams.set(k, v);
+  return memoize('sc:' + u, ttl, () => withRetry(() => fetchJSON(u.toString(), { timeout: 10000, headers: { authorization: 'OAuth ' + t, accept: 'application/json; charset=utf-8' } })));
+}
+function scTrack(t) {
+  if (!t || !(t.urn || t.id) || t.access === 'blocked' || t.streamable === false) return null;
+  const art = (t.artwork_url || t.user?.avatar_url || '').replace('-large.', '-t500x500.') || null;
+  return { id: 'sc:' + (t.urn || `soundcloud:tracks:${t.id}`), source: 'soundcloud', title: t.title, artist: t.metadata_artist || t.user?.username || '', artistId: t.user?.urn ? 'sc:' + t.user.urn : null, album: '', genre: t.genre || '', duration: Math.round((t.duration || 0) / 1000), cover: art, coverLarge: art, coverSmall: art ? art.replace('-t500x500.', '-large.') : null, plays: t.playback_count || 0, waveform: t.waveform_url || null, preview: t.access === 'preview' ? 'snippet' : undefined };
+}
+async function scStream(urn) {
+  const t = await scToken(); if (!t) fail(404, 'unavailable', 'Источник SoundCloud не подключён');
+  const s = await scApi(`/tracks/${encodeURIComponent(urn)}/streams`, {}, 60000);
+  const pick = s?.http_mp3_128_url ? ['progressive', s.http_mp3_128_url, 'mp3'] : s?.hls_aac_160_url ? ['hls', s.hls_aac_160_url, 'm4a'] : s?.hls_mp3_128_url ? ['hls', s.hls_mp3_128_url, 'mp3'] : null;
+  if (!pick) fail(404, 'unavailable', 'Трек недоступен для воспроизведения');
+  const r = await fetch(pick[1], { redirect: 'manual', headers: { authorization: 'OAuth ' + t }, signal: AbortSignal.timeout(10000) });
+  const loc = r.headers.get('location');
+  await r.body?.cancel().catch(() => {});
+  return { url: loc || pick[1], protocol: pick[0], extension: pick[2] };
+}
+const spState = { token: null, exp: 0 };
+const spReady = () => !!(CFG.spId && CFG.spSecret);
+async function spApi(p, params = {}) {
+  if (!spReady()) return null;
+  if (!spState.token || spState.exp < now() + 60000) {
+    const r = await fetchJSON('https://accounts.spotify.com/api/token', { method: 'POST', timeout: 10000, headers: { 'content-type': 'application/x-www-form-urlencoded', authorization: 'Basic ' + Buffer.from(`${CFG.spId}:${CFG.spSecret}`).toString('base64') }, body: 'grant_type=client_credentials' });
+    spState.token = r.access_token; spState.exp = now() + (r.expires_in || 3600) * 1000;
+  }
+  const u = new URL('https://api.spotify.com/v1' + p);
+  for (const [k, v] of Object.entries(params)) if (v != null && v !== '') u.searchParams.set(k, v);
+  return memoize('sp:' + u, 600000, () => withRetry(() => fetchJSON(u.toString(), { timeout: 10000, headers: { authorization: 'Bearer ' + spState.token } })));
+}
+function spTrack(t) {
+  if (!t?.id) return null;
+  const img = t.album?.images || [];
+  return { id: 'sp:' + t.id, source: 'spotify', title: t.name, artist: (t.artists || []).map((a) => a.name).join(', '), artistId: null, album: t.album?.name || '', duration: Math.round((t.duration_ms || 0) / 1000), cover: img[1]?.url || img[0]?.url || null, coverLarge: img[0]?.url || null, coverSmall: img[2]?.url || img[1]?.url || null, explicit: !!t.explicit, isrc: t.external_ids?.isrc };
+}
+
+/* Сопоставление метаданных (Deezer/Spotify) с источником полного воспроизведения */
+function similarity(a, b) {
+  const A = new Set(normText(a).split(' ').filter(Boolean)); const B = new Set(normText(b).split(' ').filter(Boolean));
+  if (!A.size || !B.size) return 0;
+  let inter = 0; for (const x of A) if (B.has(x)) inter++;
+  return inter / Math.max(A.size, B.size);
+}
+function matchScore(meta, cand) {
+  const ts = similarity(meta.title, cand.title);
+  const ma = normText(primaryArtist(meta.artist)); const ca = normText(cand.artist) + ' ' + normText(cand.title);
+  const as = ma && ca.includes(ma) ? 1 : similarity(meta.artist, cand.artist);
+  const dd = meta.duration && cand.duration ? Math.abs(meta.duration - cand.duration) : 0;
+  const dp = dd <= 3 ? 0 : dd <= 8 ? 0.15 : dd <= 20 ? 0.4 : 0.8;
+  return ts * 0.6 + as * 0.4 - dp - (cand.preview ? 0.5 : 0);
+}
+async function findPlayable(meta) {
+  const key = 'match:' + sha1(trackKey(meta) + '|' + Math.round(meta.duration || 0));
+  const cached = cacheGet(key); if (cached !== undefined) return cached;
+  const q = `${primaryArtist(meta.artist)} ${normText(meta.title)}`.trim();
+  const [cat, scl, au] = await Promise.all([
+    Promise.resolve(catalogSearch(q, 8)),
+    scReady() ? safe(scApi('/tracks', { q, access: 'playable', limit: 10 }).then((r) => (r?.collection || r || []).map(scTrack).filter(Boolean))) : [],
+    flag('audius') ? safe(auSearch(q, 8)) : [],
+  ]);
+  let best = null; let bestScore = 0.72;
+  for (const c of [...cat, ...scl, ...au]) { const sc = matchScore(meta, c); if (sc > bestScore) { best = c; bestScore = sc; } }
+  cacheSet(key, best, best ? 7 * DAY : 6 * 3600e3);
+  return best;
+}
+async function playInfo(req, tok, track, quality) {
+  const id = track.id;
+  if (id.startsWith('sl:')) return { url: `${CFG.cdnUrl}/api/stream/${Number(id.slice(3))}?k=${encodeURIComponent(tok)}${quality ? '&q=' + quality : ''}`, protocol: 'progressive', track: id };
+  if (id.startsWith('au:')) return { url: `https://api.audius.co/v1/tracks/${encodeURIComponent(id.slice(3))}/stream?app_name=${CFG.audiusApp}`, protocol: 'progressive', track: id };
+  if (id.startsWith('sc:')) return { ...(await scStream(id.slice(3))), track: id };
+  if (id.startsWith('dz:') || id.startsWith('sp:')) {
+    let meta = track;
+    if (id.startsWith('dz:') && (!meta.title || !meta.artist)) meta = dzTrack(await dz('/track/' + Number(id.slice(3)))) || meta;
+    const m = meta.title ? await findPlayable(meta) : null;
+    if (m) return { ...(await playInfo(req, tok, m, quality)), matched: m };
+    const preview = meta.preview || (id.startsWith('dz:') ? dzTrack(await safe(dz('/track/' + Number(id.slice(3))), null))?.preview : null);
+    if (preview) return { url: preview, protocol: 'progressive', preview: true, track: id };
+  }
+  fail(404, 'unavailable', 'Трек недоступен для воспроизведения');
+}
+route('POST', '/api/play', async (req) => {
+  const { token: tok } = auth(req);
+  const b = await readJSON(req);
+  const t = sanitizeTrack(b.track);
+  if (!t) fail(400, 'bad_track');
+  if (t.id.startsWith('local:')) fail(400, 'local');
+  if (!t.preview && b.track?.preview && /^https:\/\/cdn[a-z-]*\.dzcdn\.net\//.test(b.track.preview)) t.preview = b.track.preview;
+  return playInfo(req, tok, t, { low: 'low', medium: 'medium', high: 'high' }[b.quality] || '');
+});
+
+const scDownloadJobs = new Map();
+async function downloadSoundCloudFile(trackId) {
+  await toolsReady;
+  if (!scReady()) fail(404, 'unavailable', 'Источник SoundCloud не подключён');
+  const id = String(trackId || '').slice(3, 300);
+  if (!id) fail(400, 'bad_track');
+  const raw = await scApi(`/tracks/${encodeURIComponent(id)}`, {}, 3600e3);
+  if (!raw || raw.access === 'preview' || raw.streamable === false) fail(404, 'unavailable', 'Трек недоступен для загрузки');
+  const key = sha1(String(raw.urn || raw.id || id));
+  const cached = path.join(DIRS.tmp, `sc-offline-${key}.mp3`);
+  const cachedStat = await fsp.stat(cached).catch(() => null);
+  if (cachedStat?.size > 16 * 1024 && now() - cachedStat.mtimeMs < 14 * DAY) return cached;
+  if (cachedStat) await fsp.unlink(cached).catch(() => {});
+  if (scDownloadJobs.has(key)) return scDownloadJobs.get(key);
+
+  const job = (async () => {
+    const dir = await fsp.mkdtemp(path.join(DIRS.tmp, 'sc-offline-'));
+    const out = path.join(dir, 'audio.mp3');
+    try {
+      if (ytdlpOk) {
+        const target = path.join(dir, 'yt.%(ext)s');
+        const url = raw.permalink_url || `https://api.soundcloud.com/tracks/${raw.id}`;
+        const result = await sh(CFG.ytdlp, ['--no-warnings', '--no-progress', '--no-playlist', '-N', '4', '-f', 'bestaudio[ext=mp3]/bestaudio', '-x', '--audio-format', 'mp3', '--audio-quality', '0', '-o', target, url], 300000);
+        const file = (await fsp.readdir(dir)).find((name) => name.startsWith('yt.') && name.toLowerCase().endsWith('.mp3') && !name.endsWith('.part'));
+        if (result.code === 0 && file) {
+          await fsp.rename(path.join(dir, file), cached);
+          return cached;
+        }
+        warn(`yt-dlp ${id}: ${result.err.trim().split('\n').pop() || `exit ${result.code}`} → soundcloud stream`);
+      }
+
+      const stream = await scStream(raw.urn || raw.id);
+      if (stream.protocol === 'hls') {
+        if (!ffmpegOk) fail(503, 'download_unavailable', 'Для загрузки HLS-потока на сервере нужен ffmpeg');
+        const result = await sh(CFG.ffmpeg, ['-y', '-hide_banner', '-loglevel', 'error', '-i', stream.url, '-vn', '-map', '0:a:0', '-c:a', 'libmp3lame', '-q:a', '2', '-map_metadata', '-1', out], 600000);
+        if (result.code !== 0) throw new Error(result.err.trim().split('\n').pop() || `ffmpeg exit ${result.code}`);
+      } else {
+        const response = await fetch(stream.url, { headers: { 'user-agent': UA }, signal: AbortSignal.timeout(300000) });
+        if (!response.ok || !response.body) throw new Error(`SoundCloud stream HTTP ${response.status}`);
+        await pipeline(Readable.fromWeb(response.body), fs.createWriteStream(out));
+      }
+
+      const st = await fsp.stat(out).catch(() => null);
+      if (!st || st.size <= 16 * 1024) throw new Error('SoundCloud не отдал аудиофайл');
+      await fsp.rename(out, cached);
+      return cached;
+    } finally {
+      await fsp.rm(dir, { recursive: true, force: true }).catch(() => {});
+    }
+  })();
+  scDownloadJobs.set(key, job);
+  try { return await job; } finally { scDownloadJobs.delete(key); }
+}
+
+route('GET', '/api/download', async (req, { query, res }) => {
+  auth(req);
+  rateLimit(req, 'download', 60, 10 * 60e3);
+  const id = String(query.get('id') || '');
+  if (!id.startsWith('sc:')) fail(400, 'bad_track', 'Скачивание SoundCloud доступно только для треков SoundCloud');
+  const file = await downloadSoundCloudFile(id);
+  return sendFile(req, res, file, 'audio/mpeg', 'private, max-age=86400');
+});
+
+/* Волна (waveform) — реальные данные: SoundCloud или анализ файла каталога через ffmpeg */
+async function computeWaveform(file, bars = 120) {
+  if (!ffmpegOk) return null;
+  const r = await new Promise((resolve) => {
+    const chunks = []; let p;
+    try { p = spawn(CFG.ffmpeg, ['-v', 'error', '-i', file, '-ac', '1', '-ar', '2000', '-f', 's16le', '-'], { stdio: ['ignore', 'pipe', 'ignore'] }); } catch { return resolve(null); }
+    const t = setTimeout(() => p.kill('SIGKILL'), 120000);
+    p.stdout.on('data', (d) => chunks.push(d)); p.on('close', () => { clearTimeout(t); resolve(Buffer.concat(chunks)); }); p.on('error', () => { clearTimeout(t); resolve(null); });
+  });
+  if (!r || r.length < bars * 4) return null;
+  const n = Math.floor(r.length / 2); const per = Math.floor(n / bars); const peaks = [];
+  for (let b = 0; b < bars; b++) { let m = 0; for (let i = b * per; i < (b + 1) * per; i++) { const v = Math.abs(r.readInt16LE(i * 2)); if (v > m) m = v; } peaks.push(m); }
+  const max = Math.max(...peaks) || 1;
+  return peaks.map((v) => Math.round((v / max) * 100) / 100);
+}
+function downsample(samples, bars = 120) {
+  if (!Array.isArray(samples) || !samples.length) return null;
+  const per = samples.length / bars; const out = [];
+  for (let b = 0; b < bars; b++) { let m = 0; for (let i = Math.floor(b * per); i < Math.floor((b + 1) * per); i++) m = Math.max(m, samples[i] || 0); out.push(m); }
+  const max = Math.max(...out) || 1;
+  return out.map((v) => Math.round((v / max) * 100) / 100);
+}
+route('POST', '/api/waveform', async (req) => {
+  auth(req);
+  const b = await readJSON(req); const t = sanitizeTrack(b.track); if (!t) fail(400, 'bad_track');
+  const key = 'wf:' + t.id; const c = cacheGet(key); if (c !== undefined) return { peaks: c };
+  let peaks = null;
+  try {
+    if (t.id.startsWith('sl:')) peaks = J(one('SELECT waveform FROM tracks WHERE id=?', Number(t.id.slice(3)))?.waveform, null);
+    else {
+      let sc = t.id.startsWith('sc:') ? t : null;
+      if (!sc && (t.id.startsWith('dz:') || t.id.startsWith('sp:'))) { const m = await findPlayable(t); if (m?.id.startsWith('sc:')) sc = m; else if (m?.id.startsWith('sl:')) peaks = J(one('SELECT waveform FROM tracks WHERE id=?', Number(m.id.slice(3)))?.waveform, null); }
+      if (sc && scReady()) {
+        const full = sc.waveform ? sc : scTrack(await scApi(`/tracks/${encodeURIComponent(sc.id.slice(3))}`, {}, 3600e3));
+        if (full?.waveform) { const w = await fetchJSON(full.waveform.replace(/\.png$/, '.json'), { timeout: 8000 }); peaks = downsample(w.samples); }
+      }
+    }
+  } catch (e) { log('[waveform]', e.message); }
+  cacheSet(key, peaks, peaks ? 30 * DAY : 3600e3);
+  return { peaks };
+});
+
+/* ───────────────────────────── Поиск по источникам (кэш, пагинация) ───────────────────────────── */
+const PAGE = 20;
+const withTimeout = (p, ms) => Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), ms))]);
+async function searchSource(src, q, page) {
+  const off = page * PAGE;
+  if (src === 'deezer') { const r = await dz('/search', { q, index: off, limit: PAGE }, 300000); return { tracks: (r.data || []).map(dzTrack).filter(Boolean), more: !!r.next }; }
+  if (src === 'soundcloud') { if (!scReady()) return null; const r = await scApi('/tracks', { q, access: 'playable', limit: PAGE, offset: off, linked_partitioning: true }); const col = r?.collection || r || []; return { tracks: col.map(scTrack).filter(Boolean), more: !!r?.next_href }; }
+  if (src === 'spotify') { if (!spReady()) return null; const r = await spApi('/search', { q, type: 'track', limit: PAGE, offset: off }); return { tracks: (r?.tracks?.items || []).map(spTrack).filter(Boolean), more: !!r?.tracks?.next }; }
+  if (src === 'audius') { if (!flag('audius')) return null; const list = await auSearch(q, PAGE + off); return { tracks: list.slice(off, off + PAGE), more: list.length > off + PAGE }; }
+  if (src === 'catalog') { const list = all('SELECT * FROM tracks WHERE ' + lower(q).split(/\s+/).filter(Boolean).slice(0, 6).map(() => 'q LIKE ?').join(' AND ') + ' ORDER BY plays DESC LIMIT ? OFFSET ?', ...lower(q).split(/\s+/).filter(Boolean).slice(0, 6).map((w) => `%${w}%`), PAGE + 1, off).map(slTrack); return { tracks: list.slice(0, PAGE), more: list.length > PAGE }; }
+  return null;
+}
+route('GET', '/api/search', async (req, { query }) => {
+  auth(req);
+  const q = String(query.get('q') || '').trim().slice(0, 100); const type = query.get('type') || 'all';
+  const source = query.get('source') || 'all'; const page = clamp(Number(query.get('page')) || 0, 0, 20);
+  if (!q) return { tracks: [], artists: [], users: [], sources: {}, page, hasMore: false };
+  const key = 'srch:' + sha1([lower(q), type, source, page].join('|'));
+  const c = cacheGet(key); if (c) return c;
+  const srcs = source === 'all' ? ['catalog', 'soundcloud', 'deezer', 'spotify', 'audius'] : [source];
+  const sources = {};
+  const lists = type === 'users' || type === 'artists' ? [] : await Promise.all(srcs.map(async (s) => {
+    try { const r = await withTimeout(searchSource(s, q, page), 9000); sources[s] = r ? { ok: true, count: r.tracks.length, more: r.more } : { ok: false, disabled: true }; return r?.tracks || []; }
+    catch (e) { sources[s] = { ok: false, error: true }; log('[search]', s, e.message); return []; }
+  }));
+  const seen = new Set(); const tracks = [];
+  const maxLen = Math.max(0, ...lists.map((l) => l.length));
+  for (let i = 0; i < maxLen; i++) for (const l of lists) { const t = l[i]; if (!t) continue; const k = trackKey(t); if (seen.has(k)) continue; seen.add(k); tracks.push(t); }
+  let artists = []; let users = [];
+  if (page === 0 && (type === 'all' || type === 'artists')) {
+    const [dza] = await Promise.all([safe(dz('/search/artist', { q, limit: 12 }, 600000).then((r) => (r.data || []).map(dzArtist)))]);
+    artists = [...catalogArtists(q, 6), ...dza];
+  }
+  if (page === 0 && (type === 'all' || type === 'users')) users = all('SELECT * FROM users WHERE q LIKE ? AND banned=0 ORDER BY last_seen DESC LIMIT 12', `%${lower(q).replace(/^@/, '')}%`).map((u) => publicUser(u, true));
+  const out = { tracks, artists, users, sources, page, hasMore: Object.values(sources).some((s) => s.more) };
+  if (tracks.length || artists.length) cacheSet(key, out, 5 * 60e3);
+  return out;
+});
+route('GET', '/api/artist', async (req, { query }) => {
+  auth(req); const id = String(query.get('id') || '');
+  if (id.startsWith('dz:')) {
+    const aid = Number(id.slice(3));
+    const [a, top, rel, albums] = await Promise.all([
+      dz('/artist/' + aid, {}, 3600e3), dz(`/artist/${aid}/top`, { limit: 50 }, 3600e3),
+      safe(dz(`/artist/${aid}/related`, { limit: 12 }, 3600e3), {}),
+      safe(dz(`/artist/${aid}/albums`, { limit: 100 }, 3600e3), {}),
+    ]);
+    const releases = (albums.data || []).map(dzAlbum).filter((x) => x && ['album', 'ep'].includes(x.type));
+    return { artist: dzArtist(a), tracks: (top.data || []).map(dzTrack).filter(Boolean), related: (rel.data || []).map(dzArtist), releases };
+  }
+  if (id.startsWith('sl:')) {
+    const name = id.slice(3);
+    const tracks = all('SELECT * FROM tracks WHERE q LIKE ? ORDER BY plays DESC LIMIT 200', `%${lower(name)}%`).filter((t) => lower(t.artist).includes(lower(name))).map(slTrack);
+    const art = await safe(dz('/search/artist', { q: name, limit: 1 }).then((r) => r.data?.[0]), null);
+    const [top, albums] = art ? await Promise.all([
+      safe(dz(`/artist/${art.id}/top`, { limit: 30 }).then((r) => (r.data || []).map(dzTrack).filter(Boolean)), []),
+      safe(dz(`/artist/${art.id}/albums`, { limit: 100 }).then((r) => (r.data || []).map(dzAlbum).filter((x) => x && ['album', 'ep'].includes(x.type))), []),
+    ]) : [[], []];
+    return { artist: { id, source: 'soundless', name, avatar: art?.picture_xl || tracks[0]?.cover || null, tracks: tracks.length }, tracks: [...tracks, ...top], releases: albums };
+  }
+  if (id.startsWith('au:')) {
+    const uid = id.slice(3);
+    const [u, tr, albums] = await Promise.all([
+      safe(audius('/users/' + encodeURIComponent(uid)), null),
+      safe(audius(`/users/${encodeURIComponent(uid)}/tracks`, { limit: 50, sort: 'plays' })),
+      safe(audius(`/users/${encodeURIComponent(uid)}/albums`, { limit: 100, sort_method: 'recent' })),
+    ]);
+    if (!u) fail(404, 'not_found', 'Исполнитель не найден');
+    return { artist: auArtist(u), tracks: tr.map(auTrack).filter(Boolean), releases: albums.map(auAlbum).filter(Boolean) };
+  }
+  if (id.startsWith('sc:')) {
+    const urn = id.slice(3);
+    const [u, tr, pls] = await Promise.all([
+      scApi(`/users/${encodeURIComponent(urn)}`, {}, 3600e3),
+      scApi(`/users/${encodeURIComponent(urn)}/tracks`, { limit: 50, access: 'playable' }, 600000),
+      scApi(`/users/${encodeURIComponent(urn)}/playlists`, { limit: 200 }, 600000),
+    ]);
+    if (!u) fail(404, 'not_found', 'Исполнитель не найден');
+    const releases = (pls?.collection || pls || []).filter((p) => p?.kind === 'playlist' && ['album', 'ep'].includes(String(p.set_type || '').toLowerCase())).map((p) => ({
+      id: 'sc:' + (p.id || p.urn || ''), source: 'soundcloud', title: p.title || 'Без названия',
+      type: String(p.set_type).toLowerCase(), trackCount: p.track_count || p.tracks?.length || 0,
+      cover: (p.artwork_url || '').replace('-large.', '-t500x500.') || null, releaseDate: p.release_date || p.created_at || '', permalink: p.permalink_url || null,
+    }));
+    return { artist: { id, source: 'soundcloud', name: u.username, avatar: (u.avatar_url || '').replace('-large.', '-t500x500.'), followers: u.followers_count || 0 }, tracks: (tr?.collection || tr || []).map(scTrack).filter(Boolean), releases };
+  }
+  fail(400, 'bad_id');
+});
+route('GET', '/api/album', async (req, { query }) => {
+  auth(req);
+  const id = String(query.get('id') || '');
+  if (id.startsWith('dz:')) {
+    const albumId = Number(id.slice(3));
+    if (!Number.isSafeInteger(albumId) || albumId < 1) fail(400, 'bad_id');
+    const [album, list] = await Promise.all([dz(`/album/${albumId}`, {}, 3600e3), dz(`/album/${albumId}/tracks`, { limit: 100 }, 3600e3)]);
+    const meta = dzAlbum(album);
+    const tracks = (list.data || []).map((t) => {
+      const track = dzTrack(t);
+      return track ? { ...track, album: album.title || track.album, cover: album.cover_big || album.cover_medium || track.cover, coverLarge: album.cover_xl || album.cover_big || track.coverLarge, coverSmall: album.cover_medium || album.cover_small || track.coverSmall } : null;
+    }).filter(Boolean);
+    return { album: meta, tracks };
+  }
+  if (id.startsWith('sc:')) {
+    const playlistId = id.slice(3);
+    if (!playlistId) fail(400, 'bad_id');
+    const playlist = await scApi(`/playlists/${encodeURIComponent(playlistId)}`, {}, 3600e3);
+    if (!playlist) fail(404, 'not_found', 'Альбом не найден');
+    const tracks = (playlist.tracks || []).map(scTrack).filter(Boolean);
+    return { album: { id, source: 'soundcloud', title: playlist.title || 'Без названия', type: String(playlist.set_type || 'album').toLowerCase(), trackCount: tracks.length, cover: (playlist.artwork_url || '').replace('-large.', '-t500x500.') || null }, tracks };
+  }
+  if (id.startsWith('au:')) {
+    const albumId = id.slice(3);
+    if (!albumId) fail(400, 'bad_id');
+    const [album, list] = await Promise.all([
+      audius(`/playlists/${encodeURIComponent(albumId)}`, {}, 3600e3),
+      audius(`/playlists/${encodeURIComponent(albumId)}/tracks`, { limit: 100 }, 3600e3),
+    ]);
+    if (!album) fail(404, 'not_found', 'Альбом не найден');
+    return { album: auAlbum(album), tracks: (Array.isArray(list) ? list : []).map(auTrack).filter(Boolean) };
+  }
+  fail(400, 'bad_id');
+});
+
+/* ───────────────────────────── Вкус, волна, миксы, умная очередь ───────────────────────────── */
+route('GET', '/api/taste/artists', async (req, { query }) => {
+  auth(req); const q = String(query.get('q') || '').trim();
+  const r = q ? await dz('/search/artist', { q, limit: 24 }, 600000) : await dz('/chart/0/artists', { limit: 30 }, 3600e3);
+  return (r.data || []).map(dzArtist);
+});
+route('PUT', '/api/me/taste', async (req) => {
+  const { user } = auth(req); const b = await readJSON(req);
+  const list = (Array.isArray(b.artists) ? b.artists : []).filter((a) => a && /^dz:\d+$/.test(String(a.id))).slice(0, 30).map((a) => ({ id: String(a.id), name: String(a.name || '').slice(0, 80), avatar: typeof a.avatar === 'string' && a.avatar.startsWith('https://') ? a.avatar.slice(0, 300) : null }));
+  run('UPDATE users SET taste_artists=? WHERE id=?', JSON.stringify(list), user.id);
+  return privateUser(one('SELECT * FROM users WHERE id=?', user.id));
+});
+function spread(list) { // не ставим один и тот же исполнитель подряд
+  const out = []; const pool = shuffle(list);
+  while (pool.length) { const i = pool.findIndex((t) => !out.length || primaryArtist(t.artist) !== primaryArtist(out[out.length - 1].artist)); out.push(pool.splice(i >= 0 ? i : 0, 1)[0]); }
+  return out;
+}
+async function tasteSeeds(user) {
+  let artists = J(user.taste_artists, []).map((a) => Number(String(a.id).slice(3))).filter(Boolean);
+  if (!artists.length) {
+    const names = topArtists(user.id, now() - 90 * DAY, 5).map((a) => a.name);
+    const found = await Promise.all(names.map((n) => safe(dz('/search/artist', { q: n, limit: 1 }, 7 * DAY).then((r) => r.data?.[0]?.id), null)));
+    artists = found.filter(Boolean);
+  }
+  return artists.slice(0, 10);
+}
+async function buildWave(user, advanced) {
+  const seeds = await tasteSeeds(user);
+  if (!seeds.length) return (await dz('/chart/0/tracks', { limit: 50 }, 3600e3)).data.map(dzTrack).filter(Boolean);
+  const parts = await Promise.all(seeds.map(async (aid) => {
+    const [top, rel] = await Promise.all([safe(dz(`/artist/${aid}/top`, { limit: 6 }, 6 * 3600e3), {}), safe(dz(`/artist/${aid}/related`, { limit: advanced ? 6 : 4 }, 24 * 3600e3), {})]);
+    const relTop = await Promise.all((rel.data || []).map((a) => safe(dz(`/artist/${a.id}/top`, { limit: advanced ? 3 : 2 }, 6 * 3600e3), {}).then((r) => r.data || [])));
+    let deep = [];
+    if (advanced && rel.data?.[0]) { // второй круг похожих — только для Aura
+      const r2 = await safe(dz(`/artist/${rel.data[0].id}/related`, { limit: 4 }, 24 * 3600e3), {});
+      deep = (await Promise.all((r2.data || []).map((a) => safe(dz(`/artist/${a.id}/top`, { limit: 2 }, 6 * 3600e3), {}).then((r) => r.data || [])))).flat();
+    }
+    return [...(top.data || []), ...relTop.flat(), ...deep];
+  }));
+  const likes = all('SELECT data FROM likes WHERE user_id=? ORDER BY created_at DESC LIMIT 40', user.id).map((r) => J(r.data, null)).filter(Boolean);
+  return spread(uniq([...parts.flat().map(dzTrack).filter(Boolean), ...shuffle(likes).slice(0, 8)])).slice(0, advanced ? 80 : 50);
+}
+route('GET', '/api/wave', async (req) => { const { user } = auth(req); return buildWave(user, can(user.id, 'mixes.advanced')); });
+const MOODS = [
+  { id: 'evening', title: 'Спокойный вечер', q: 'chill evening' },
+  { id: 'city', title: 'Энергия города', q: 'city energy' },
+  { id: 'inspire', title: 'Вдохновение', q: 'inspiration' },
+  { id: 'night', title: 'Ночной драйв', q: 'night drive' },
+];
+async function moodMix(m) {
+  const pls = await dz('/search/playlist', { q: m.q, limit: 6 }, 6 * 3600e3);
+  const pl = (pls.data || []).find((p) => p.nb_tracks >= 15) || pls.data?.[0];
+  if (!pl) return null;
+  const tr = await dz(`/playlist/${pl.id}/tracks`, { limit: 60 }, 6 * 3600e3);
+  const tracks = (tr.data || []).map(dzTrack).filter(Boolean);
+  return { id: m.id, title: m.title, cover: pl.picture_xl || pl.picture_big || tracks[0]?.coverLarge || null, count: tracks.length, tracks };
+}
 route('GET', '/api/home', async (req) => {
   const { user } = auth(req);
-  const taste = J(user.taste, []);
-  const arts = topArtists(user.id, now() - 60 * DAY, 4);
-  const recent = recentTracks(user.id, 16);
-  const recentIds = new Set(recent.map((t) => t.id));
-  const likes = all('SELECT data FROM likes WHERE user_id=? ORDER BY created_at DESC LIMIT 60', user.id).map((r) => J(r.data, null)).filter(Boolean);
-  const genre = taste[0] || recent.find((t) => t.genre)?.genre || undefined;
-  const last = recent[0];
-  const [byArtists, trending, genreTrend, byTrack] = await Promise.all([
-    Promise.all(arts.map(async (a) => [...catalogSearch(a.name, 6), ...(await auSearch(a.name, 6))].filter((t) => lower(t.artist).includes(lower(a.name))))).then((x) => x.flat()),
-    auTrending(undefined, 30),
-    genre ? auTrending(genre, 20) : Promise.resolve([]),
-    last ? Promise.all([Promise.resolve(catalogSearch(primaryArtist(last.artist), 8)), auSearch(primaryArtist(last.artist), 8), last.genre ? auTrending(last.genre, 12, 'month') : []]).then((x) => x.flat()) : Promise.resolve([]),
+  const advanced = can(user.id, 'mixes.advanced');
+  const likes = all('SELECT data FROM likes WHERE user_id=? ORDER BY created_at DESC LIMIT 80', user.id).map((r) => J(r.data, null)).filter(Boolean);
+  const favorites = uniq([...likes, ...topTracks(user.id, 0, 40)]);
+  const [wave, moods, chart] = await Promise.all([
+    safe(buildWave(user, advanced), []),
+    Promise.all(MOODS.map((m) => safe(moodMix(m), null))),
+    safe(dz('/chart/0/tracks', { limit: 30 }, 3600e3).then((r) => r.data.map(dzTrack).filter(Boolean)), []),
   ]);
-  const catalogNew = all('SELECT * FROM tracks ORDER BY id DESC LIMIT 20').map(slTrack);
-  const forYou = uniq(shuffle([...byArtists, ...likes.slice(0, 20), ...topTracks(user.id, now() - 30 * DAY, 10)])).slice(0, 40);
-  const discover = uniq(shuffle([...genreTrend, ...trending.slice(0, 15), ...catalogNew.slice(0, 10)]).filter((t) => !recentIds.has(t.id))).slice(0, 40);
-  const tasteByTrack = uniq(byTrack.filter((t) => t.id !== last?.id)).slice(0, 30);
-  const mix = uniq(shuffle([...forYou.slice(0, 18), ...discover.slice(0, 12)])).slice(0, 30);
+  const mixes = [];
+  if (favorites.length) mixes.push({ id: 'favorites', title: 'Твои любимые треки', cover: favorites.find((t) => t.coverLarge || t.cover)?.coverLarge || favorites[0]?.cover || null, count: favorites.length, tracks: favorites });
+  for (const m of moods) if (m && m.tracks.length) mixes.push(m);
+  if (advanced && wave.length) {
+    const deep = [...wave].sort((a, b) => (a.rank || 0) - (b.rank || 0)).slice(0, 40);
+    mixes.unshift({ id: 'aura-blend', title: 'Aura Blend', aura: true, cover: wave[0]?.coverLarge || null, count: Math.min(60, wave.length), tracks: spread(uniq([...wave.slice(0, 30), ...moods.filter(Boolean).flatMap((m) => m.tracks.slice(0, 8))])).slice(0, 60) });
+    mixes.push({ id: 'deep-cuts', title: 'Глубже', aura: true, cover: deep[0]?.coverLarge || null, count: deep.length, tracks: deep });
+  }
   const friends = all('SELECT u.* FROM follows f JOIN follows g ON g.follower=f.followee AND g.followee=f.follower JOIN users u ON u.id=f.followee WHERE f.follower=? ORDER BY u.last_seen DESC LIMIT 20', user.id)
     .map((x) => ({ ...publicUser(x, true), nowPlaying: nowPlayingOf(x) })).filter((x) => x.nowPlaying);
-  const artistsOf = (list) => [...new Set(list.map((t) => primaryArtist(t.artist)).filter(Boolean))];
+  return { wave, mixes, recent: recentTracks(user.id, 20), popular: chart, catalogNew: all('SELECT * FROM tracks ORDER BY id DESC LIMIT 20').map(slTrack), friends, tasteArtists: J(user.taste_artists, []) };
+});
+route('POST', '/api/queue/smart', async (req) => {
+  const { user } = auth(req); const b = await readJSON(req);
+  const seed = sanitizeTrack(b.seed); const recent = new Set((Array.isArray(b.recent) ? b.recent : []).map(String).slice(0, 300));
+  const count = clamp(Number(b.count) || 10, 1, 30);
+  let pool = [];
+  try {
+    if (seed?.id.startsWith('sc:') && scReady()) { const r = await scApi(`/tracks/${encodeURIComponent(seed.id.slice(3))}/related`, { limit: 30, access: 'playable' }, 3600e3); pool.push(...(r?.collection || r || []).map(scTrack).filter(Boolean)); }
+    let aid = seed?.artistId?.startsWith('dz:') ? Number(seed.artistId.slice(3)) : null;
+    if (!aid && seed?.artist) aid = await safe(dz('/search/artist', { q: primaryArtist(seed.artist), limit: 1 }, 7 * DAY).then((r) => r.data?.[0]?.id), null);
+    if (aid) {
+      const [top, rel] = await Promise.all([safe(dz(`/artist/${aid}/top`, { limit: 10 }, 6 * 3600e3), {}), safe(dz(`/artist/${aid}/related`, { limit: 8 }, 24 * 3600e3), {})]);
+      const relTop = await Promise.all((rel.data || []).map((a) => safe(dz(`/artist/${a.id}/top`, { limit: 4 }, 6 * 3600e3), {}).then((r) => r.data || [])));
+      pool.push(...[...(top.data || []).slice(0, 4), ...relTop.flat()].map(dzTrack).filter(Boolean));
+    }
+    if (pool.length < count) pool.push(...(await safe(buildWave(user, false), [])));
+  } catch (e) { log('[smart]', e.message); }
+  const seen = new Set([...recent]); if (seed) seen.add(seed.id);
+  const keys = new Set(seed ? [trackKey(seed)] : []);
+  const out = [];
+  for (const t of spread(pool)) { if (seen.has(t.id) || keys.has(trackKey(t))) continue; seen.add(t.id); keys.add(trackKey(t)); out.push(t); if (out.length >= count) break; }
+  return out;
+});
+
+/* Плейлисты по текстовому описанию */
+const PROMPT_WORDS = [
+  [/спокой|расслаб|chill|relax|уют/i, 'chill'], [/груст|печал|sad|меланх/i, 'sad'], [/весел|радост|happy|позитив/i, 'happy'], [/энерг|драйв|energy|бодр/i, 'energy'],
+  [/трениров|спорт|зал|gym|workout|бег/i, 'workout'], [/сон|засып|sleep/i, 'sleep'], [/ноч|night/i, 'night'], [/утр|morning/i, 'morning'], [/дожд|rain/i, 'rainy'],
+  [/любов|романт|love/i, 'love'], [/вечерин|туса|party/i, 'party'], [/фокус|учеб|работ|focus|study/i, 'focus'], [/дорог|поездк|машин|drive|road/i, 'road trip'],
+  [/лет[оа]|summer/i, 'summer'], [/зим|winter/i, 'winter'], [/рэп|хип.?хоп|rap|hip.?hop/i, 'rap'], [/рок|rock/i, 'rock'], [/поп\b|pop/i, 'pop'], [/джаз|jazz/i, 'jazz'],
+  [/электрон|edm|electronic/i, 'electronic'], [/техно|techno/i, 'techno'], [/хаус|house/i, 'house'], [/фонк|phonk/i, 'phonk'], [/lo.?fi|лоу.?фай/i, 'lofi'],
+  [/класси|classical/i, 'classical'], [/инди|indie/i, 'indie'], [/метал|metal/i, 'metal'], [/панк|punk/i, 'punk'], [/r&b|рнб|rnb/i, 'rnb'], [/соул|soul/i, 'soul'],
+  [/дрилл|drill/i, 'drill'], [/трэп|trap/i, 'trap'], [/80|восьмидесят/i, '80s'], [/90|девяност/i, '90s'], [/нулев|2000/i, '2000s'], [/русск|russian/i, 'russian'], [/k.?pop|кей.?поп/i, 'kpop'],
+];
+route('POST', '/api/playlists/generate', async (req) => {
+  const { user } = auth(req); rateLimit(req, 'gen', 30, 600e3);
+  const b = await readJSON(req); const prompt = String(b.prompt || '').trim().slice(0, 200);
+  if (prompt.length < 3) fail(400, 'bad_prompt', 'Опишите плейлист хотя бы парой слов');
+  const lim = limitsOf(user.id).textPlaylistsPerDay;
+  if (lim != null && one("SELECT COUNT(*) c FROM generations WHERE user_id=? AND kind='text' AND created_at>?", user.id, now() - DAY).c >= lim) fail(402, 'aura_required', `Бесплатно — ${lim} плейлиста в сутки. С Aura — без ограничений`);
+  const words = PROMPT_WORDS.filter(([re]) => re.test(prompt)).map(([, w]) => w);
+  const like = /(?:как|в стиле|похож(?:ее|ие)? на|типа|like)\s+([^,.;]+)/i.exec(prompt)?.[1]?.trim();
+  const query = words.slice(0, 3).join(' ') || prompt;
+  const size = can(user.id, 'playlists.text.unlimited') ? 50 : 30;
+  const [pls, trs, art] = await Promise.all([
+    safe(dz('/search/playlist', { q: query, limit: 4 }, 6 * 3600e3), {}),
+    safe(dz('/search', { q: query, limit: 25 }, 600000), {}),
+    like ? safe(dz('/search/artist', { q: like, limit: 1 }, DAY).then((r) => r.data?.[0]), null) : null,
+  ]);
+  const fromPl = (await Promise.all((pls.data || []).slice(0, 2).map((p) => safe(dz(`/playlist/${p.id}/tracks`, { limit: 40 }, 6 * 3600e3), {}).then((r) => r.data || [])))).flat();
+  let fromArtist = [];
+  if (art) { const rel = await safe(dz(`/artist/${art.id}/related`, { limit: 6 }, DAY), {}); fromArtist = (await Promise.all([art, ...(rel.data || [])].map((a) => safe(dz(`/artist/${a.id}/top`, { limit: 4 }, 6 * 3600e3), {}).then((r) => r.data || [])))).flat(); }
+  const tracks = spread(uniq([...fromArtist, ...fromPl, ...(trs.data || [])].map(dzTrack).filter(Boolean))).slice(0, size);
+  if (!tracks.length) fail(404, 'nothing_found', 'Не нашлось подходящих треков — попробуйте описать иначе');
+  const name = prompt.charAt(0).toUpperCase() + prompt.slice(1, 60);
+  const r = run('INSERT INTO playlists(user_id,name,description,public,created_at,updated_at) VALUES(?,?,?,?,?,?)', user.id, name, `Собрано по описанию: «${prompt}»`, 0, now(), now());
+  const pid = Number(r.lastInsertRowid);
+  tx(() => tracks.forEach((t, i) => run('INSERT INTO playlist_tracks(playlist_id,pos,track_id,data,added_at) VALUES(?,?,?,?,?)', pid, i, t.id, JSON.stringify(sanitizeTrack(t)), now())));
+  run("INSERT INTO generations(user_id,kind,created_at) VALUES(?, 'text', ?)", user.id, now());
+  logEvent(user.id, 'playlist');
+  return playlistOut(one('SELECT * FROM playlists WHERE id=?', pid), true);
+});
+
+/* ───────────────────────────── Комнаты совместного прослушивания (SSE) ───────────────────────────── */
+const rooms = new Map();
+const roomCode = () => { let c; do { c = Array.from({ length: 6 }, () => 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'[crypto.randomInt(0, 32)]).join(''); } while (rooms.has(c)); return c; };
+function roomOut(r) {
+  return { code: r.code, name: r.name, hostId: r.hostId, max: r.max, allowControl: r.allowControl, state: r.state, queue: r.queue, chat: r.chat.slice(-40),
+    members: [...r.members.keys()].map((id) => { const u = one('SELECT * FROM users WHERE id=?', id); return u && { ...publicUser(u, true), host: id === r.hostId, live: [...r.streams].some((s) => s.uid === id) }; }).filter(Boolean) };
+}
+function roomEmit(r, type, data) { r.touched = now(); const msg = `event: ${type}\ndata: ${JSON.stringify(data)}\n\n`; for (const s of r.streams) { try { s.res.write(msg); } catch {} } }
+function getRoom(code) { const r = rooms.get(String(code || '').toUpperCase()); if (!r) fail(404, 'room_not_found', 'Комната не найдена или закрыта'); return r; }
+function leaveRoom(r, uid) {
+  r.members.delete(uid);
+  if (r.hostId === uid) { const next = [...r.members.keys()][0]; if (next) r.hostId = next; else { roomEmit(r, 'closed', {}); rooms.delete(r.code); return; } }
+  roomEmit(r, 'room', roomOut(r));
+}
+route('POST', '/api/rooms', async (req) => {
+  const { user } = auth(req); const b = await readJSON(req);
+  for (const r of rooms.values()) if (r.hostId === user.id) leaveRoom(r, user.id);
+  const r = { code: roomCode(), name: String(b.name || `Комната ${user.name}`).slice(0, 60), hostId: user.id, max: limitsOf(user.id).roomSize, allowControl: false, members: new Map([[user.id, now()]]), streams: new Set(), state: null, queue: [], chat: [], touched: now() };
+  rooms.set(r.code, r); logEvent(user.id, 'room_host');
+  return roomOut(r);
+});
+route('GET', '/api/rooms/:code', (req, { params }) => { auth(req); return roomOut(getRoom(params.code)); });
+route('POST', '/api/rooms/:code/join', (req, { params }) => {
+  const { user } = auth(req); const r = getRoom(params.code);
+  if (!r.members.has(user.id)) {
+    if (r.members.size >= r.max) fail(409, 'room_full', `Комната заполнена: максимум ${r.max} участников`);
+    r.members.set(user.id, now()); roomEmit(r, 'room', roomOut(r));
+  }
+  return roomOut(r);
+});
+route('POST', '/api/rooms/:code/leave', (req, { params }) => { const { user } = auth(req); const r = rooms.get(String(params.code).toUpperCase()); if (r) leaveRoom(r, user.id); return { ok: true }; });
+route('PATCH', '/api/rooms/:code', async (req, { params }) => {
+  const { user } = auth(req); const r = getRoom(params.code); if (r.hostId !== user.id) fail(403, 'not_host', 'Только ведущий может менять настройки');
+  const b = await readJSON(req); if (b.allowControl !== undefined) r.allowControl = !!b.allowControl; if (b.name) r.name = String(b.name).slice(0, 60);
+  roomEmit(r, 'room', roomOut(r)); return roomOut(r);
+});
+route('GET', '/api/rooms/:code/events', (req, { params, res }) => {
+  const { user } = auth(req); const r = getRoom(params.code);
+  if (!r.members.has(user.id)) fail(403, 'not_member', 'Сначала присоединитесь к комнате');
+  res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-cache, no-transform', Connection: 'keep-alive', 'X-Accel-Buffering': 'no', ...CORS });
+  const s = { res, uid: user.id }; r.streams.add(s);
+  res.write(`event: room\ndata: ${JSON.stringify(roomOut(r))}\n\n`);
+  roomEmit(r, 'room', roomOut(r));
+  const ping = setInterval(() => { try { res.write(': ping\n\n'); } catch {} }, 20000);
+  req.on('close', () => {
+    clearInterval(ping); r.streams.delete(s);
+    setTimeout(() => { if (rooms.has(r.code) && ![...r.streams].some((x) => x.uid === user.id) && r.members.has(user.id)) leaveRoom(r, user.id); }, 45000);
+  });
+  return undefined;
+});
+route('POST', '/api/rooms/:code/state', async (req, { params }) => {
+  const { user } = auth(req); const r = getRoom(params.code);
+  if (r.hostId !== user.id && !(r.allowControl && r.members.has(user.id))) fail(403, 'not_host', 'Управлять может только ведущий');
+  const b = await readJSON(req);
+  r.state = { track: b.track ? sanitizeTrack(b.track) : null, position: Math.max(0, Number(b.position) || 0), playing: !!b.playing, at: now(), by: user.id };
+  roomEmit(r, 'state', r.state); return { ok: true };
+});
+route('POST', '/api/rooms/:code/queue', async (req, { params }) => {
+  const { user } = auth(req); const r = getRoom(params.code); if (!r.members.has(user.id)) fail(403, 'not_member');
+  const t = sanitizeTrack((await readJSON(req)).track); if (!t) fail(400, 'bad_track');
+  if (r.queue.length >= 100) fail(409, 'queue_full', 'Очередь комнаты заполнена');
+  r.queue.push({ ...t, addedBy: user.id, addedByName: user.name }); roomEmit(r, 'queue', r.queue); return { ok: true };
+});
+route('DELETE', '/api/rooms/:code/queue/:i', (req, { params }) => {
+  const { user } = auth(req); const r = getRoom(params.code); if (r.hostId !== user.id) fail(403, 'not_host');
+  r.queue.splice(Number(params.i), 1); roomEmit(r, 'queue', r.queue); return { ok: true };
+});
+route('POST', '/api/rooms/:code/chat', async (req, { params }) => {
+  const { user } = auth(req); const r = getRoom(params.code); if (!r.members.has(user.id)) fail(403, 'not_member');
+  rateLimit(req, 'chat', 30, 60e3);
+  const text = String((await readJSON(req)).text || '').trim().slice(0, 300); if (!text) fail(400, 'empty');
+  const m = { id: token(6), user: publicUser(user, true), text, at: now() }; r.chat.push(m); if (r.chat.length > 100) r.chat.shift();
+  roomEmit(r, 'chat', m); return { ok: true };
+});
+setInterval(() => { for (const r of rooms.values()) if (!r.streams.size && now() - r.touched > 15 * 60e3) rooms.delete(r.code); }, 60000).unref();
+
+/* ───────────────────────────── Офлайн-библиотека: учёт квоты на сервере ───────────────────────────── */
+const deviceOf = (req, b) => String(b?.device || req.headers['x-device-id'] || 'default').slice(0, 64);
+route('GET', '/api/offline', (req, { query }) => {
+  const { user } = auth(req); const device = String(query.get('device') || 'default').slice(0, 64);
+  const used = one('SELECT COALESCE(SUM(bytes),0) s FROM offline_items WHERE user_id=? AND device=?', user.id, device).s;
+  return { used, limit: limitsOf(user.id).offlineBytes, count: one('SELECT COUNT(*) c FROM offline_items WHERE user_id=? AND device=?', user.id, device).c };
+});
+route('POST', '/api/offline/register', async (req) => {
+  const { user } = auth(req); const b = await readJSON(req); const device = deviceOf(req, b);
+  const id = String(b.trackId || '').slice(0, 160); const bytes = Math.max(0, Math.round(Number(b.bytes) || 0));
+  if (!id) fail(400, 'bad_track');
+  const used = one('SELECT COALESCE(SUM(bytes),0) s FROM offline_items WHERE user_id=? AND device=? AND track_id<>?', user.id, device, id).s;
+  const limit = limitsOf(user.id).offlineBytes;
+  if (used + bytes > limit) fail(402, 'offline_limit', `Офлайн-хранилище заполнено (${Math.round(limit / GB)} ГБ). С Aura — до 10 ГБ`);
+  run('INSERT OR REPLACE INTO offline_items(user_id,device,track_id,bytes,created_at) VALUES(?,?,?,?,?)', user.id, device, id, bytes, now());
+  return { used: used + bytes, limit };
+});
+route('POST', '/api/offline/unregister', async (req) => {
+  const { user } = auth(req); const b = await readJSON(req); const device = deviceOf(req, b);
+  if (b.all) run('DELETE FROM offline_items WHERE user_id=? AND device=?', user.id, device);
+  else run('DELETE FROM offline_items WHERE user_id=? AND device=? AND track_id=?', user.id, device, String(b.trackId || ''));
+  return { ok: true };
+});
+
+/* ───────────────────────────── Ранний доступ (Aura): сборки с пометкой «early» в GitHub Releases ───────────────────────────── */
+const GH_REPO = (process.env.GITHUB_REPO || CFG.downloadUrl.replace(/^https:\/\/github\.com\//, '')).replace(/\/+$/, '');
+route('GET', '/api/updates/early', async (req) => {
+  const { user } = auth(req); requireEnt(user.id, 'early_access', 'Ранний доступ к новым версиям — с подпиской Aura');
+  if (!/^[\w.-]+\/[\w.-]+$/.test(GH_REPO)) return null;
+  const key = 'gh:early'; const c = cacheGet(key); if (c !== undefined) return c;
+  const list = await fetchJSON(`https://api.github.com/repos/${GH_REPO}/releases?per_page=15`, { timeout: 12000, headers: { accept: 'application/vnd.github+json' } }).catch(() => []);
+  const r = (Array.isArray(list) ? list : []).find((x) => !x.draft && /early/i.test(`${x.tag_name} ${x.name}`));
+  const asset = (re) => r?.assets?.find((a) => re.test(a.name));
+  const out = r ? { version: r.tag_name.replace(/^v/i, ''), early: true, notes: String(r.body || '').split(/\r?\n/).map((l) => l.replace(/^[-*]\s*/, '').trim()).filter(Boolean).slice(0, 12), date: r.published_at,
+    windows: asset(/\.exe$/i) ? { url: asset(/\.exe$/i).browser_download_url, size: asset(/\.exe$/i).size } : null, android: asset(/\.apk$/i) ? { url: asset(/\.apk$/i).browser_download_url, size: asset(/\.apk$/i).size } : null } : null;
+  cacheSet(key, out, 10 * 60e3); return out;
+});
+
+/* ───────────────────────────── Синхронизация между устройствами (Aura) ───────────────────────────── */
+route('GET', '/api/sync', (req) => { const { user } = auth(req); requireEnt(user.id, 'sync', 'Синхронизация между устройствами доступна с Aura'); return J(user.sync_state, {}); });
+route('PUT', '/api/sync', async (req) => {
+  const { user } = auth(req); requireEnt(user.id, 'sync', 'Синхронизация между устройствами доступна с Aura');
+  const b = await readJSON(req); const cur = J(user.sync_state, {});
+  const next = { ...cur, updatedAt: now(), device: String(b.device || '').slice(0, 80) };
+  if (b.settings && typeof b.settings === 'object') next.settings = b.settings;
+  if (b.playback && typeof b.playback === 'object') next.playback = { track: sanitizeTrack(b.playback.track), queue: (Array.isArray(b.playback.queue) ? b.playback.queue : []).slice(0, 200).map(sanitizeTrack).filter(Boolean), index: Number(b.playback.index) || 0, position: Number(b.playback.position) || 0, at: now(), device: next.device };
+  const str = JSON.stringify(next); if (str.length > 200000) fail(413, 'too_large');
+  run('UPDATE users SET sync_state=? WHERE id=?', str, user.id); return { ok: true, updatedAt: next.updatedAt };
+});
+
+/* ───────────────────────────── Расширенная статистика и достижения ───────────────────────────── */
+function streaks(dayKeys) {
+  const days = [...new Set(dayKeys)].sort((a, b) => a - b); let best = 0; let cur = 0; let prev = null;
+  for (const d of days) { cur = prev != null && d === prev + 1 ? cur + 1 : 1; best = Math.max(best, cur); prev = d; }
+  const today = Math.floor(now() / DAY); const last = days[days.length - 1];
+  return { best, current: last != null && today - last <= 1 ? cur : 0 };
+}
+function userFacts(uid, tz) {
+  const rows = all('SELECT played_at, listened, artist_key, data FROM plays WHERE user_id=?', uid);
+  const dayKey = (t) => Math.floor((t + tz) / DAY);
+  const perDay = new Map(); const genres = new Set(); let night = 0;
+  for (const r of rows) { const k = dayKey(r.played_at); perDay.set(k, (perDay.get(k) || 0) + (r.listened || 0)); const h = new Date(r.played_at + tz).getUTCHours(); if (h < 5) night++; const g = J(r.data, {}).genre; if (g) genres.add(lower(g)); }
+  const st = streaks([...perDay.keys()]);
   return {
-    mix: mix.length ? mix : trending,
-    sections: [
-      { id: 'forYou', title: 'Для вас', tracks: forYou.length ? forYou : trending.slice(0, 20), artists: artistsOf(forYou.length ? forYou : trending) },
-      { id: 'discover', title: 'Открытия', tracks: discover.length ? discover : trending, artists: artistsOf(discover.length ? discover : trending) },
-      { id: 'byTrack', title: 'Вкус по треку', tracks: tasteByTrack.length ? tasteByTrack : shuffle(trending).slice(0, 20), seed: last || null, artists: artistsOf(tasteByTrack) },
-    ],
-    recent, trending, catalogNew, friends, topArtists: arts, genre: genre || null,
+    plays: rows.length, artists: new Set(rows.map((r) => r.artist_key).filter(Boolean)).size, nightPlays: night, genres: genres.size,
+    likes: one('SELECT COUNT(*) c FROM likes WHERE user_id=?', uid).c, friends: friendsCount(uid), playlists: one('SELECT COUNT(*) c FROM playlists WHERE user_id=?', uid).c,
+    roomsHosted: one("SELECT COUNT(*) c FROM events WHERE user_id=? AND kind='room_host'", uid).c, maxDaySeconds: Math.max(0, ...perDay.values()), bestStreak: st.best, currentStreak: st.current,
+  };
+}
+const ACHIEVEMENTS = [
+  { id: 'first', title: 'Первый трек', desc: 'Послушать первый трек', target: 1, v: (f) => f.plays },
+  { id: 'p100', title: 'Сотня', desc: '100 прослушиваний', target: 100, v: (f) => f.plays },
+  { id: 'p1000', title: 'Меломан', desc: '1000 прослушиваний', target: 1000, v: (f) => f.plays },
+  { id: 'explorer', title: 'Исследователь', desc: '25 разных артистов', target: 25, v: (f) => f.artists },
+  { id: 'night', title: 'Ночная смена', desc: 'Слушать музыку с 0:00 до 5:00', target: 1, v: (f) => f.nightPlays },
+  { id: 'likes50', title: 'Коллекционер', desc: '50 любимых треков', target: 50, v: (f) => f.likes },
+  { id: 'social', title: 'Своя компания', desc: '3 друга', target: 3, v: (f) => f.friends },
+  { id: 'curator', title: 'Куратор', desc: 'Создать плейлист', target: 1, v: (f) => f.playlists },
+  { id: 'marathon', ext: true, title: 'Марафон', desc: '3 часа музыки за день', target: 10800, v: (f) => f.maxDaySeconds },
+  { id: 'streak7', ext: true, title: 'Неделя в ритме', desc: '7 дней подряд', target: 7, v: (f) => f.bestStreak },
+  { id: 'streak30', ext: true, title: 'Месяц в ритме', desc: '30 дней подряд', target: 30, v: (f) => f.bestStreak },
+  { id: 'genres10', ext: true, title: 'Без границ', desc: '10 разных жанров', target: 10, v: (f) => f.genres },
+  { id: 'host', ext: true, title: 'Ведущий', desc: 'Провести комнату совместного прослушивания', target: 1, v: (f) => f.roomsHosted },
+  { id: 'p10000', ext: true, title: 'Легенда', desc: '10 000 прослушиваний', target: 10000, v: (f) => f.plays },
+];
+function achievementsOf(uid, tz = 0) {
+  const f = userFacts(uid, tz); const ext = can(uid, 'achievements.extended');
+  return ACHIEVEMENTS.map((a) => { const value = Math.min(a.target, a.v(f)); return { id: a.id, title: a.title, desc: a.desc, ext: !!a.ext, locked: !!a.ext && !ext, target: a.target, value, unlocked: (!a.ext || ext) && value >= a.target }; });
+}
+route('GET', '/api/me/achievements', (req, { query }) => { const { user } = auth(req); return achievementsOf(user.id, clamp(Number(query.get('tz')) || 0, -900, 900) * 60000); });
+route('GET', '/api/me/stats', (req, { query }) => {
+  const { user } = auth(req); const tz = clamp(Number(query.get('tz')) || 0, -900, 900) * 60000;
+  const detailed = can(user.id, 'stats.detailed');
+  const range = clamp(Number(query.get('range')) || 30, 7, limitsOf(user.id).statsDays);
+  const start = Math.floor((now() + tz) / DAY) * DAY - tz - (range - 1) * DAY;
+  const rows = all('SELECT played_at, listened, artist_key, artist, track_id, source, data FROM plays WHERE user_id=? AND played_at>=?', user.id, start);
+  const days = Array.from({ length: range }, (_, i) => ({ date: start + i * DAY, plays: 0, seconds: 0 }));
+  const hours = Array(24).fill(0); const heat = detailed ? Array.from({ length: 7 }, () => Array(24).fill(0)) : null;
+  const genres = new Map(); const sources = new Map(); const artistsIn = new Set();
+  for (const r of rows) {
+    const i = Math.floor((r.played_at - start) / DAY); if (days[i]) { days[i].plays++; days[i].seconds += r.listened || 0; }
+    const d = new Date(r.played_at + tz); hours[d.getUTCHours()]++; if (heat) heat[(d.getUTCDay() + 6) % 7][d.getUTCHours()]++;
+    const g = J(r.data, {}).genre; if (g) genres.set(g, (genres.get(g) || 0) + 1);
+    sources.set(r.source || 'other', (sources.get(r.source || 'other') || 0) + 1); if (r.artist_key) artistsIn.add(r.artist_key);
+  }
+  const before = new Set(all('SELECT DISTINCT artist_key k FROM plays WHERE user_id=? AND played_at<?', user.id, start).map((r) => r.k));
+  const tot = one('SELECT COUNT(*) c, SUM(listened) s, COUNT(DISTINCT artist_key) a, COUNT(DISTINCT track_id) t FROM plays WHERE user_id=?', user.id);
+  const f = userFacts(user.id, tz);
+  return {
+    range, detailed, maxRange: limitsOf(user.id).statsDays,
+    plays: tot.c, seconds: tot.s || 0, artists: tot.a, tracks: tot.t, level: levelOf(tot.c),
+    period: { plays: rows.length, seconds: rows.reduce((s, r) => s + (r.listened || 0), 0), artists: artistsIn.size, avgPerDay: Math.round(rows.length / range * 10) / 10 },
+    streak: { current: f.currentStreak, best: f.bestStreak }, days, hours, peakHour: hours.indexOf(Math.max(...hours)),
+    topArtists: topArtists(user.id, start, 10), topTracks: topTracks(user.id, start, 10),
+    heatmap: heat, genres: detailed ? [...genres.entries()].sort((a, b) => b[1] - a[1]).slice(0, 8).map(([name, n]) => ({ name, plays: n })) : null,
+    sources: detailed ? [...sources.entries()].map(([name, n]) => ({ name, plays: n })) : null,
+    newArtists: detailed ? [...artistsIn].filter((k) => !before.has(k)).length : null,
   };
 });
 
@@ -892,7 +1692,13 @@ const server = http.createServer(async (req, res) => {
     try {
       if (flag('maintenance') && !/^\/api\/(health|config)$/.test(url.pathname)) fail(503, 'maintenance', 'Идут технические работы. Скоро вернёмся!');
       const out = await r.handler(req, { params: m.groups || {}, query: url.searchParams, res, url });
-      if (!res.headersSent && out !== undefined) send(res, 200, out);
+      if (!res.headersSent && out !== undefined) {
+        if (req.method === 'GET') {
+          const body = JSON.stringify(out); const etag = `W/"${sha1(body).slice(0, 27)}"`;
+          if (req.headers['if-none-match'] === etag) { res.writeHead(304, { ETag: etag, 'Cache-Control': 'private, no-cache', ...CORS }); res.end(); }
+          else { res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'private, no-cache', ETag: etag, ...CORS }); res.end(body); }
+        } else send(res, 200, out);
+      }
     } catch (e) {
       if (e instanceof HttpError) { if (!res.headersSent) send(res, e.status, { error: e.code, message: e.message }); }
       else { log('[error]', req.method, url.pathname, e.stack || e); if (!res.headersSent) send(res, 500, { error: 'internal', message: 'Ошибка сервера' }); }
@@ -977,8 +1783,8 @@ function vMain() {
   const users = one('SELECT COUNT(*) c FROM users').c; const online = one('SELECT COUNT(*) c FROM users WHERE last_seen>?', now() - 120000).c;
   const tracks = one('SELECT COUNT(*) c FROM tracks').c; const today = one('SELECT COUNT(*) c FROM plays WHERE played_at>?', now() - DAY).c;
   return {
-    text: `<b>${em('bot')} Soundless · Панель управления</b>\n\n${em('people')} Пользователи: <b>${fmtNum(users)}</b> · онлайн <b>${fmtNum(online)}</b>\n${em('box')} Каталог: <b>${fmtNum(tracks)}</b> ${plural(tracks, 'трек', 'трека', 'треков')}\n${em('growth')} За сутки: <b>${fmtNum(today)}</b> ${plural(today, 'прослушивание', 'прослушивания', 'прослушиваний')}\n\n<i>Отправьте аудиофайл в этот чат, чтобы добавить его в каталог.</i>`,
-    kb: KB([B('Статистика', 'a:stats', 'stats'), B('Пользователи', 'a:users:0', 'people')], [B('Каталог', 'a:cat', 'box'), B('Рассылка', 'a:bc', 'megaphone')], [B('Настройки', 'a:set', 'settings'), B('Приложение', CFG.downloadUrl, 'apps')]),
+    text: `<b>${em('bot')} Soundless · Панель управления</b>\n\n${em('people')} Пользователи: <b>${fmtNum(users)}</b> · онлайн <b>${fmtNum(online)}</b>\n${em('box')} Каталог: <b>${fmtNum(tracks)}</b> ${plural(tracks, 'трек', 'трека', 'треков')}\n${em('growth')} За сутки: <b>${fmtNum(today)}</b> ${plural(today, 'прослушивание', 'прослушивания', 'прослушиваний')}\n${em('gift')} Aura: <b>${fmtNum(auraCount())}</b> активных\n\n<i>Отправьте аудиофайл в этот чат, чтобы добавить его в каталог.</i>`,
+    kb: KB([B('Статистика', 'a:stats', 'stats'), B('Пользователи', 'a:users:0', 'people')], [B('Каталог', 'a:cat', 'box'), B('Aura', 'a:aura:0', 'gift')], [B('Рассылка', 'a:bc', 'megaphone'), B('Настройки', 'a:set', 'settings')]),
   };
 }
 function vStats() {
@@ -989,9 +1795,9 @@ function vStats() {
   const pt = one('SELECT COUNT(*) c, SUM(listened) s FROM plays'); const cat = one('SELECT COUNT(*) c, SUM(size) s FROM tracks');
   const top = all('SELECT title, artist, COUNT(*) c FROM plays WHERE played_at>? GROUP BY track_id ORDER BY c DESC LIMIT 5', now() - DAY);
   const topA = all("SELECT MAX(artist) a, COUNT(*) c FROM plays WHERE played_at>? AND artist_key<>'' GROUP BY artist_key ORDER BY c DESC LIMIT 3", now() - 7 * DAY);
-  const bots = c('SELECT COUNT(*) c FROM bot_users WHERE blocked=0');
+  const bots = c('SELECT COUNT(*) c FROM bot_users WHERE blocked=0'); const aura = auraCount(); const google = c('SELECT COUNT(*) c FROM users WHERE google_sub IS NOT NULL');
   return {
-    text: `<b>${em('stats')} Статистика</b>\n\n${em('people')} <b>Пользователи</b>\n├ Всего: <b>${fmtNum(users)}</b>\n├ Новых: <b>${fmtNum(d1)}</b> за сутки · <b>${fmtNum(d7)}</b> за неделю\n├ Онлайн: <b>${fmtNum(online)}</b> · активных за сутки <b>${fmtNum(active)}</b>\n└ В боте: <b>${fmtNum(bots)}</b>\n\n${em('growth')} <b>Прослушивания</b>\n├ Сутки: <b>${fmtNum(p1)}</b> · неделя <b>${fmtNum(p7)}</b>\n└ Всего: <b>${fmtNum(pt.c)}</b> · ${fmtNum(Math.round((pt.s || 0) / 3600))} ч\n\n${em('box')} <b>Каталог</b>\n└ ${fmtNum(cat.c)} ${plural(cat.c, 'трек', 'трека', 'треков')} · ${fmtSize(cat.s || 0)}` +
+    text: `<b>${em('stats')} Статистика</b>\n\n${em('people')} <b>Пользователи</b>\n├ Всего: <b>${fmtNum(users)}</b>\n├ Новых: <b>${fmtNum(d1)}</b> за сутки · <b>${fmtNum(d7)}</b> за неделю\n├ Онлайн: <b>${fmtNum(online)}</b> · активных за сутки <b>${fmtNum(active)}</b>\n├ С Google: <b>${fmtNum(google)}</b>\n└ Aura: <b>${fmtNum(aura)}</b>\n\n${em('growth')} <b>Прослушивания</b>\n├ Сутки: <b>${fmtNum(p1)}</b> · неделя <b>${fmtNum(p7)}</b>\n└ Всего: <b>${fmtNum(pt.c)}</b> · ${fmtNum(Math.round((pt.s || 0) / 3600))} ч\n\n${em('box')} <b>Каталог</b>\n└ ${fmtNum(cat.c)} ${plural(cat.c, 'трек', 'трека', 'треков')} · ${fmtSize(cat.s || 0)}` +
       (top.length ? `\n\n${em('party')} <b>Топ за сутки</b>\n` + top.map((t, i) => `${i + 1}. ${esc(t.artist)} — ${esc(t.title)} <i>(${t.c})</i>`).join('\n') : '') +
       (topA.length ? `\n\n${em('profile')} <b>Артисты недели</b>\n` + topA.map((t) => `· ${esc(primaryArtist(t.a))} <i>(${t.c})</i>`).join('\n') : ''),
     kb: KB([B('Обновить', 'a:stats', 'loading'), BACK('a:main')]),
@@ -1013,12 +1819,34 @@ function vUser(id) {
   const plays = playsCount(u.id); const lv = levelOf(plays); const sess = one('SELECT COUNT(*) c FROM sessions WHERE user_id=?', u.id).c;
   const np = nowPlayingOf(u);
   return {
-    text: `<b>${em('profile')} ${esc(u.name)}</b>${u.verified ? ' ' + em('check') : ''}\n@${esc(u.username)} · ID <code>${u.id}</code>\n\n${em('calendar')} Регистрация: ${fmtDate(u.created_at)}\n${em('clock')} ${isOnline(u) ? '<b>В сети</b>' : 'Был(а): ' + (u.last_seen ? new Date(u.last_seen).toLocaleString('ru-RU') : '—')}\n${em('growth')} Уровень <b>${lv.level}</b> · ${fmtNum(plays)} ${plural(plays, 'прослушивание', 'прослушивания', 'прослушиваний')}\n${em('people')} Друзей: ${friendsCount(u.id)} · подписчиков: ${followersCount(u.id)}\n${em('link')} Telegram: ${u.tg_id ? (u.tg_username ? '@' + esc(u.tg_username) : '<code>' + u.tg_id + '</code>') : 'не привязан'}\n${em('lock')} Сессий: ${sess}` +
+    text: `<b>${em('profile')} ${esc(u.name)}</b>${u.verified ? ' ' + em('check') : ''}\n@${esc(u.username)} · ID <code>${u.id}</code>\n\n${em('calendar')} Регистрация: ${fmtDate(u.created_at)}\n${em('clock')} ${isOnline(u) ? '<b>В сети</b>' : 'Был(а): ' + (u.last_seen ? new Date(u.last_seen).toLocaleString('ru-RU') : '—')}\n${em('growth')} Уровень <b>${lv.level}</b> · ${fmtNum(plays)} ${plural(plays, 'прослушивание', 'прослушивания', 'прослушиваний')}\n${em('people')} Друзей: ${friendsCount(u.id)} · подписчиков: ${followersCount(u.id)}\n${em('lock')} Сессий: ${sess}\n${em('gift')} Aura: ${auraLine(u.id)}${u.google_email ? `\n${em('link')} Google: ${esc(u.google_email)}` : ''}` +
       (np ? `\n\n${em('eye')} Слушает: <b>${esc(np.track.artist)} — ${esc(np.track.title)}</b>` : '') + (u.banned ? `\n\n${em('lock')} <b>Аккаунт заблокирован</b>` : ''),
     kb: KB(
       [u.banned ? B('Разблокировать', 'a:ub:' + u.id, 'unlock', 'success') : B('Заблокировать', 'a:ub:' + u.id, 'lock', 'danger'), B(u.verified ? 'Снять галочку' : 'Верифицировать', 'a:uv:' + u.id, u.verified ? 'cross' : 'check')],
       [B('Сбросить пароль', 'a:ur:' + u.id, 'pencil'), B('Завершить сессии', 'a:us:' + u.id, 'timePassed')],
+      [B('Подписка Aura', 'a:ua:' + u.id, 'gift', auraOf(u.id).active ? undefined : 'primary')],
       [B('Удалить аккаунт', 'a:ud:' + u.id, 'trash', 'danger')], [BACK('a:users:0')]),
+  };
+}
+function auraCount() { return one('SELECT COUNT(*) c FROM subscriptions WHERE expires_at IS NULL OR expires_at>?', now()).c; }
+function auraLine(uid) { const a = auraOf(uid); if (!a.active) return a.expiresAt ? `истекла ${fmtDate(a.expiresAt)}` : 'нет'; return a.expiresAt ? `<b>активна</b> до ${fmtDate(a.expiresAt)}` : '<b>активна</b> · бессрочно'; }
+function vUserAura(id) {
+  const u = one('SELECT * FROM users WHERE id=?', id); if (!u) return { text: `${em('cross')} Пользователь не найден`, kb: KB([BACK('a:aura:0')]) };
+  const a = auraOf(u.id);
+  return {
+    text: `<b>${em('gift')} Soundless Aura</b>\n\n${em('profile')} ${esc(u.name)} · @${esc(u.username)}\nСтатус: ${auraLine(u.id)}\n\n<i>Продление добавляет срок к текущей дате окончания.</i>`,
+    kb: KB([B('+30 дней', `a:ag:${u.id}:30`, 'calendar', 'success'), B('+90 дней', `a:ag:${u.id}:90`, 'calendar', 'success')], [B('+365 дней', `a:ag:${u.id}:365`, 'calendar', 'success'), B('Навсегда', `a:ag:${u.id}:0`, 'party', 'success')],
+      a.active || a.expiresAt ? [B('Отозвать Aura', `a:ar:${u.id}`, 'cross', 'danger')] : null, [BACK('a:u:' + u.id)]),
+  };
+}
+function vAura(page = 0) {
+  const per = 8; const total = one('SELECT COUNT(*) c FROM subscriptions').c; const pages = Math.max(1, Math.ceil(total / per)); page = clamp(page, 0, pages - 1);
+  const list = all('SELECT s.*, u.username, u.name FROM subscriptions s JOIN users u ON u.id=s.user_id ORDER BY (s.expires_at IS NULL) DESC, s.expires_at DESC LIMIT ? OFFSET ?', per, page * per);
+  return {
+    text: `<b>${em('gift')} Soundless Aura</b>\n\nАктивных подписок: <b>${fmtNum(auraCount())}</b> · всего записей: ${fmtNum(total)}\n\n${em('info')} Выдать подписку: откройте пользователя → «Подписка Aura».\n\n<b>Что даёт Aura:</b> бейдж с бликом, расширенный профиль, анимированные аватары и баннеры, продвинутые миксы, безлимит плейлистов по описанию, расширенное караоке, офлайн до 10 ГБ, синхронизация устройств, подробная статистика, комнаты до 10 человек, расширенные достижения, ранний доступ.`,
+    kb: KB(...list.map((s) => [B(`${s.name} · @${s.username}${s.expires_at && s.expires_at < now() ? ' · истекла' : ''}`.slice(0, 60), 'a:ua:' + s.user_id, s.expires_at && s.expires_at < now() ? 'clock' : 'gift')]),
+      pages > 1 ? [B('‹', `a:aura:${Math.max(0, page - 1)}`), B(`${page + 1} / ${pages}`, 'a:noop'), B('›', `a:aura:${Math.min(pages - 1, page + 1)}`)] : null,
+      [B('Найти пользователя', 'a:usearch', 'eye'), BACK('a:main')]),
   };
 }
 function vCatalog() {
@@ -1076,25 +1904,6 @@ function vSettings() {
 }
 const vPrompt = (title, hint, back) => ({ text: `<b>${title}</b>\n\n${hint}`, kb: KB([B('Отмена', back, 'cross')]) });
 
-/* — Экраны пользователя — */
-function linkedUser(chatId) { return one('SELECT * FROM users WHERE tg_id=?', chatId); }
-function vStart(chatId) {
-  const u = linkedUser(chatId);
-  return {
-    text: `<b>${em('smile')} Soundless</b> — музыка без лишнего шума.\n\n${em('download')} Скачайте приложение для Windows или Android, войдите и слушайте с караоке-текстами, кроссфейдом и друзьями.` + (u ? `\n\n${em('userOk')} Аккаунт: <b>${esc(u.name)}</b> · @${esc(u.username)}` : `\n\n${em('link')} Привяжите Telegram в приложении: <i>Настройки → Интеграции</i> — так можно входить в один тап и восстанавливать пароль.`),
-    kb: KB([B('Скачать приложение', CFG.downloadUrl, 'download')], u ? [B('Мой аккаунт', 'u:acc', 'profile')] : null, isAdmin(chatId) ? [B('Панель управления', 'a:main', 'settings')] : null),
-  };
-}
-function vAccount(chatId) {
-  const u = linkedUser(chatId); if (!u) return vStart(chatId);
-  const plays = playsCount(u.id); const lv = levelOf(plays); const np = nowPlayingOf(u); const top = topArtists(u.id, 0, 3);
-  return {
-    text: `<b>${em('profile')} ${esc(u.name)}</b>${u.verified ? ' ' + em('check') : ''}\n@${esc(u.username)}\n\n${em('growth')} Уровень <b>${lv.level}</b> · ${fmtNum(plays)} ${plural(plays, 'трек', 'трека', 'треков')}\n${em('people')} Друзей: <b>${friendsCount(u.id)}</b> · подписчиков: <b>${followersCount(u.id)}</b>\n${em('calendar')} С нами с ${fmtDate(u.created_at)}` +
-      (top.length ? `\n\n${em('party')} Любимые артисты: ${top.map((a) => esc(a.name)).join(', ')}` : '') + (np ? `\n\n${em('eye')} Сейчас: <b>${esc(np.track.artist)} — ${esc(np.track.title)}</b>` : ''),
-    kb: KB([B('Уведомления', 'u:notif', J(u.notify, {}).telegram === false ? 'hidden' : 'bell'), B('Отвязать', 'u:unlink', 'cross', 'danger')], [BACK('u:start')]),
-  };
-}
-
 async function importAudio(msg, statusId) {
   const chat = msg.chat.id; const a = msg.audio || msg.document;
   if (a.file_size && a.file_size > 20 * 1024 * 1024 && /api\.telegram\.org/.test(CFG.tgApi)) {
@@ -1117,6 +1926,7 @@ async function importAudio(msg, statusId) {
   const mime = a.mime_type && a.mime_type.startsWith('audio/') ? a.mime_type : MIME[ext] || 'audio/mpeg';
   const r = run('INSERT INTO tracks(title,artist,album,genre,duration,file,mime,size,cover,gain,tg_file_id,uploaded_by,created_at,q) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)', title, artist, album, genre, duration, name, mime, size, cover, gain, a.file_id, chat, now(), trackQ({ title, artist, album, genre }));
   const id = Number(r.lastInsertRowid); log('[catalog] +', artist, '—', title);
+  computeWaveform(dest).then((w) => w && run('UPDATE tracks SET waveform=? WHERE id=?', JSON.stringify(w), id)).catch(() => {});
   const v = vTrack(id); v.text = `${em('party')} <b>Добавлено в каталог</b>\n\n` + v.text;
   return bot.show(chat, v, statusId);
 }
@@ -1165,6 +1975,15 @@ async function onCallback(cq) {
         }
         case 'ud': { const u = one('SELECT * FROM users WHERE id=?', +x); await bot.show(chat, { text: `${em('trash')} <b>Удалить аккаунт @${esc(u?.username)}?</b>\n\nИстория, лайки и плейлисты будут удалены навсегда.`, kb: KB([B('Удалить', 'a:udy:' + x, 'trash', 'danger'), B('Отмена', 'a:u:' + x, 'cross')]) }, mid); break; }
         case 'udy': run('DELETE FROM users WHERE id=?', +x); toast = 'Аккаунт удалён'; await bot.show(chat, vUsers(0), mid); break;
+        case 'aura': await bot.show(chat, vAura(+x || 0), mid); break;
+        case 'ua': await bot.show(chat, vUserAura(+x), mid); break;
+        case 'ag': {
+          const days = Number(y); const cur = auraOf(+x); const base = cur.active && cur.expiresAt ? cur.expiresAt : now();
+          const exp = days === 0 ? null : base + days * DAY;
+          run('INSERT INTO subscriptions(user_id,plan,started_at,expires_at,granted_by,note) VALUES(?,?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET expires_at=excluded.expires_at, granted_by=excluded.granted_by, started_at=CASE WHEN subscriptions.expires_at IS NOT NULL AND subscriptions.expires_at<' + now() + ' THEN excluded.started_at ELSE subscriptions.started_at END', +x, 'aura', now(), exp, from, days ? `+${days}d` : 'forever');
+          toast = days ? `Aura продлена на ${days} дн.` : 'Aura выдана навсегда'; await bot.show(chat, vUserAura(+x), mid); break;
+        }
+        case 'ar': run('UPDATE subscriptions SET expires_at=? WHERE user_id=?', now() - 1000, +x); toast = 'Aura отозвана'; await bot.show(chat, vUserAura(+x), mid); break;
         case 'cat': await bot.show(chat, vCatalog(), mid); break;
         case 'tl': await bot.show(chat, vTracks(+x || 0, y), mid); break;
         case 'tsearch': bot.setState(chat, 'tsearch', {}, mid); await bot.show(chat, vPrompt(`${em('eye')} Поиск по каталогу`, 'Отправьте название или исполнителя.', 'a:cat'), mid); break;
@@ -1192,41 +2011,8 @@ async function onCallback(cq) {
           broadcast(chat, fc, fm).catch((e) => log('[bc]', e.message)); break;
         }
       }
-    } else if (d.startsWith('u:')) {
-      const act = d.slice(2);
-      if (act === 'start') await bot.show(chat, vStart(chat), mid);
-      else if (act === 'acc') await bot.show(chat, vAccount(chat), mid);
-      else if (act === 'unlink') await bot.show(chat, { text: `${em('cross')} <b>Отвязать Telegram?</b>\n\nВход в один тап и восстановление пароля через бота станут недоступны.`, kb: KB([B('Отвязать', 'u:unlinky', 'cross', 'danger'), B('Отмена', 'u:acc', 'check')]) }, mid);
-      else if (act === 'unlinky') { run('UPDATE users SET tg_id=NULL, tg_username=NULL WHERE tg_id=?', chat); toast = 'Telegram отвязан'; await bot.show(chat, vStart(chat), mid); }
-      else if (act === 'notif') { const u = linkedUser(chat); if (u) { const n = J(u.notify, {}); n.telegram = n.telegram === false; run('UPDATE users SET notify=? WHERE id=?', JSON.stringify(n), u.id); toast = n.telegram ? 'Уведомления включены' : 'Уведомления выключены'; } await bot.show(chat, vAccount(chat), mid); }
-    } else if (d.startsWith('lk:')) {
-      const [, code, ans] = d.split(':'); const c = one('SELECT * FROM codes WHERE code=? AND kind=?', code, 'link');
-      if (!c || c.expires_at < now()) { await bot.show(chat, { text: `${em('clock')} Ссылка устарела. Сгенерируйте новую в приложении.`, kb: KB([BACK('u:start')]) }, mid); }
-      else if (ans === 'y') {
-        run('UPDATE users SET tg_id=NULL, tg_username=NULL WHERE tg_id=?', from);
-        run('UPDATE users SET tg_id=?, tg_username=? WHERE id=?', from, cq.from.username || null, c.user_id); run('DELETE FROM codes WHERE code=?', code);
-        const u = one('SELECT * FROM users WHERE id=?', c.user_id);
-        await bot.show(chat, { text: `${em('party')} <b>Telegram привязан</b>\n\nАккаунт: <b>${esc(u.name)}</b> · @${esc(u.username)}\nТеперь можно входить в один тап и получать уведомления.`, kb: KB([B('Мой аккаунт', 'u:acc', 'profile')]) }, mid);
-      } else { run('DELETE FROM codes WHERE code=?', code); await bot.show(chat, vStart(chat), mid); }
-    } else if (d.startsWith('lg:')) {
-      const [, code, ans] = d.split(':'); const c = one('SELECT * FROM codes WHERE code=? AND kind=?', code, 'login');
-      if (!c || c.expires_at < now() || J(c.data, {}).status !== 'pending') { await bot.show(chat, { text: `${em('clock')} Запрос на вход устарел. Попробуйте ещё раз в приложении.`, kb: KB([BACK('u:start')]) }, mid); }
-      else if (ans === 'y' || ans === 'new') {
-        let u = linkedUser(from);
-        if (!u && ans === 'new') {
-          if (!flag('registration')) { await bot.show(chat, { text: `${em('lock')} Регистрация временно закрыта.`, kb: KB([BACK('u:start')]) }, mid); return; }
-          let un = lower(cq.from.username || '').replace(/[^a-z0-9_.]/g, '').slice(0, 24);
-          if (!validUsername(un) || RESERVED.has(un) || one('SELECT id FROM users WHERE username=?', un)) un = 'user' + String(from).slice(-8);
-          while (one('SELECT id FROM users WHERE username=?', un)) un = 'user' + crypto.randomInt(1e6, 1e8);
-          const name = [cq.from.first_name, cq.from.last_name].filter(Boolean).join(' ').slice(0, 40) || un;
-          const r = run('INSERT INTO users(username,name,pass,tg_id,tg_username,created_at,last_seen,q) VALUES(?,?,?,?,?,?,?,?)', un, name, '!', from, cq.from.username || null, now(), now(), lower(`${un} ${name}`));
-          u = one('SELECT * FROM users WHERE id=?', Number(r.lastInsertRowid)); bot.onRegister(u.id);
-        }
-        if (!u) { await bot.show(chat, vStart(chat), mid); return; }
-        if (u.banned) { await bot.show(chat, { text: `${em('lock')} Аккаунт заблокирован.`, kb: KB() }, mid); return; }
-        run('UPDATE codes SET user_id=?, data=? WHERE code=?', u.id, JSON.stringify({ status: 'ok' }), code);
-        await bot.show(chat, { text: `${em('check')} <b>Вход подтверждён</b>\n\nВозвращайтесь в приложение — вы вошли как <b>${esc(u.name)}</b> (@${esc(u.username)}).`, kb: KB([B('Мой аккаунт', 'u:acc', 'profile')]) }, mid);
-      } else { run('UPDATE codes SET data=? WHERE code=?', JSON.stringify({ status: 'denied' }), code); await bot.show(chat, { text: `${em('cross')} Вход отклонён.`, kb: KB([BACK('u:start')]) }, mid); }
+    } else {
+      await bot.api('answerCallbackQuery', { callback_query_id: cq.id, text: 'Доступ только для администратора', show_alert: true }); return;
     }
   } catch (e) { log('[bot cb]', e.message); toast = 'Ошибка: ' + e.message.slice(0, 150); alert = true; }
   await bot.api('answerCallbackQuery', { callback_query_id: cq.id, text: toast || undefined, show_alert: alert }).catch(() => {});
@@ -1235,29 +2021,15 @@ async function onCallback(cq) {
 async function onMessage(msg) {
   const chat = msg.chat.id; if (msg.chat.type !== 'private') return;
   run('INSERT INTO bot_users(chat_id,username,first_name,created_at) VALUES(?,?,?,?) ON CONFLICT(chat_id) DO UPDATE SET username=excluded.username, first_name=excluded.first_name, blocked=0', chat, msg.from?.username || null, msg.from?.first_name || null, now());
-  const linked = linkedUser(chat); if (linked && (msg.from?.username || null) !== linked.tg_username) run('UPDATE users SET tg_username=? WHERE id=?', msg.from?.username || null, linked.id);
   const text = msg.text || ''; const admin = isAdmin(chat);
-  if (text.startsWith('/start')) {
-    bot.clearState(chat); const payload = text.split(/\s+/)[1] || '';
-    if (payload.startsWith('link_')) {
-      const code = payload.slice(5); const c = one('SELECT * FROM codes WHERE code=? AND kind=?', code, 'link'); const u = c && one('SELECT * FROM users WHERE id=?', c.user_id);
-      if (!c || !u || c.expires_at < now()) return bot.show(chat, { text: `${em('clock')} Ссылка для привязки устарела. Сгенерируйте новую в приложении.`, kb: KB([B('Скачать приложение', CFG.downloadUrl, 'download')]) });
-      return bot.show(chat, { text: `${em('link')} <b>Привязать Telegram к аккаунту?</b>\n\n<b>${esc(u.name)}</b> · @${esc(u.username)}${linked && linked.id !== u.id ? `\n\n${em('info')} Сейчас Telegram привязан к @${esc(linked.username)} — привязка перейдёт на новый аккаунт.` : ''}`, kb: KB([B('Привязать', `lk:${code}:y`, 'check', 'success'), B('Отмена', `lk:${code}:n`, 'cross')]) });
-    }
-    if (payload.startsWith('login_')) {
-      const code = payload.slice(6); const c = one('SELECT * FROM codes WHERE code=? AND kind=?', code, 'login');
-      if (!c || c.expires_at < now()) return bot.show(chat, { text: `${em('clock')} Запрос на вход устарел. Нажмите «Войти через Telegram» в приложении ещё раз.`, kb: KB() });
-      const dev = J(c.data, {}).device;
-      if (linked) return bot.show(chat, { text: `${em('lock')} <b>Вход в Soundless</b>\n\nАккаунт: <b>${esc(linked.name)}</b> · @${esc(linked.username)}${dev ? `\nУстройство: ${esc(dev)}` : ''}\n\nПодтвердите, если это вы.`, kb: KB([B('Войти', `lg:${code}:y`, 'check', 'success'), B('Отклонить', `lg:${code}:n`, 'cross', 'danger')]) });
-      return bot.show(chat, { text: `${em('userOk')} <b>Добро пожаловать в Soundless</b>\n\nК этому Telegram ещё не привязан аккаунт. Создадим его за секунду — логин и имя возьмём из профиля, пароль можно задать позже в настройках.`, kb: KB([B('Создать аккаунт', `lg:${code}:new`, 'userOk', 'success')], [B('Отмена', `lg:${code}:n`, 'cross')]) });
-    }
-    if (admin) await bot.send(chat, `${em('settings')} Панель администратора включена`, { keyboard: [[{ text: 'Панель', icon_custom_emoji_id: EMOJI.settings[0] }, { text: 'Статистика', icon_custom_emoji_id: EMOJI.stats[0] }, { text: 'Каталог', icon_custom_emoji_id: EMOJI.box[0] }]], resize_keyboard: true, is_persistent: true }).catch(() => {});
-    return bot.show(chat, admin ? vMain() : vStart(chat));
+  if (!admin) { if (text.startsWith('/start')) await bot.send(chat, `${em('lock')} <b>Soundless</b>\n\nЭтот бот — служебная панель администратора и недоступен для других пользователей.`).catch(() => {}); return; }
+  if (text.startsWith('/start') || text === '/admin' || text === 'Панель') {
+    bot.clearState(chat);
+    if (text.startsWith('/start')) await bot.send(chat, `${em('settings')} Панель администратора включена`, { keyboard: [[{ text: 'Панель', icon_custom_emoji_id: EMOJI.settings[0] }, { text: 'Статистика', icon_custom_emoji_id: EMOJI.stats[0] }, { text: 'Каталог', icon_custom_emoji_id: EMOJI.box[0] }]], resize_keyboard: true, is_persistent: true }).catch(() => {});
+    return bot.show(chat, vMain());
   }
-  if (admin && (text === '/admin' || text === 'Панель')) { bot.clearState(chat); return bot.show(chat, vMain()); }
-  if (admin && text === 'Статистика') { bot.clearState(chat); return bot.show(chat, vStats()); }
-  if (admin && text === 'Каталог') { bot.clearState(chat); return bot.show(chat, vCatalog()); }
-
+  if (text === 'Статистика') { bot.clearState(chat); return bot.show(chat, vStats()); }
+  if (text === 'Каталог') { bot.clearState(chat); return bot.show(chat, vCatalog()); }
   const st = bot.getState(chat);
   const isAudioDoc = msg.document && (/^audio\//.test(msg.document.mime_type || '') || /\.(mp3|m4a|flac|ogg|opus|wav|aac)$/i.test(msg.document.file_name || ''));
   if (admin && (msg.audio || isAudioDoc) && !(st?.state === 'bct')) {
@@ -1304,8 +2076,7 @@ async function onMessage(msg) {
       }
     }
   }
-  if (admin) return bot.show(chat, vMain());
-  return bot.show(chat, vStart(chat));
+  return bot.show(chat, vMain());
 }
 
 async function botLoop() {
